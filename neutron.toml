@@ -3,3 +3,7 @@ name = "websocket"
 entry = "src/lib.nt"
 output = "websocket"
 compiler = "^0.1"
+
+[ffi]
+search_paths = ["native"]
+libraries = ["wsio", "c"]

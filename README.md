@@ -24,6 +24,11 @@ use websocket
 - **Framing**: encode/decode RFC 6455 frames (FIN, opcode, masking, payload
   lengths 7/16/64-bit), helpers for text/binary/close/ping/pong messages
 - **Client**: `ws://` URL parsing and TCP connect + opening handshake
+- **Byte-safe transport**: socket I/O uses a small native FFI helper
+  (`native/libwsio.a`) for byte-accurate send/receive (all byte values 0-255),
+  supporting masked client frames and binary payloads
+- **DNS resolution**: hostname resolution supported via the native helper
+  (in addition to `localhost` and numeric IPv4 addresses)
 - **Byte-level APIs**: protocol operations work on `array[int]` byte buffers
   (values 0-255) using explicit integer/bitwise manipulation
 
@@ -57,9 +62,8 @@ Types: `Frame`, `DecodeResult`, `Url`, `Connection`.
 - `parse_url(view string url) -> Url`
 - `connect(view string url) -> Connection`
 
-`Connection` methods include `send_text`, `send_binary_hex`, `send_ping`,
-`send_pong`, `send_close`, `pump`, `receive_frame`, `transmit_bytes`,
-`close_socket`.
+`Connection` methods: `send_text`, `send_binary_hex`, `send_ping`, `send_pong`,
+`send_close`, `pump`, `receive_frame`, `transmit_bytes`, `close_socket`.
 
 ### Utilities
 
@@ -100,24 +104,17 @@ fun main() {
 }
 ```
 
-## Transport limitations
+## Notes and limitations
 
-This module targets the current Neutron runtime without compiler/runtime
-modifications.
-
-- **`wss://` (TLS)** is not supported by the `connect` helper.
-- Network transport uses the string-based `net` API. `Connection.transmit_bytes`
-  rejects frame bytes with values > 127 and reports an error via
-  `conn.last_error`, because arbitrary binary bytes cannot be sent safely
-  through string-based socket I/O. As a result, most masked client-to-server
-  frames (whose XORed wire bytes commonly include values > 127) cannot be
-  transmitted over this path in the current runtime.
-- `pump` reads string data from `net.recv` and converts by character code;
-  binary/non-text payloads received from the network may not round-trip
-  faithfully.
-
-The protocol core (handshake computation, frame construction/parsing, masking,
-SHA-1/Base64) is fully implemented and tested over in-memory byte arrays.
+- **`wss://` (TLS)** is not supported by `connect`.
+- Transport uses the bundled native FFI helper (`[ffi]` → `native/libwsio.a`)
+  for byte-safe TCP I/O. Hostname resolution is supported by the helper; the
+  target platform must be able to link against the provided library and libc.
+- `pump` reads byte-by-byte from the socket; the socket receive timeout is set
+  by the native helper, so `pump` may block waiting for data when the buffer is
+  empty (treat as "no frame available yet" in polling loops).
+- Protocol correctness (handshake, framing, masking, SHA-1/Base64) is covered
+  by in-memory tests.
 
 ## License
 

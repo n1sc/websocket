@@ -13,9 +13,17 @@
 
 use arrays
 use crypto
-use net
 use strings
 use testing
+
+extern "C" fun ws_host_reset()
+extern "C" fun ws_host_append(int ch)
+extern "C" fun ws_host_connect(int port) -> int
+extern "C" fun ws_tcp_connect_ip(int a, int b, int c, int d, int port) -> int
+extern "C" fun ws_tcp_connect_localhost(int port) -> int
+extern "C" fun ws_send_byte(int fd, int value) -> int
+extern "C" fun ws_recv_byte(int fd) -> int
+extern "C" fun ws_close_fd(int fd) -> int
 
 // ── Byte helpers ───────────────────────────────────────────────────────────
 
@@ -675,37 +683,26 @@ class Connection {
 
     fun close_socket() {
         if (this.socket > 0) {
-            try { net.close(this.socket) } catch (_) {}
+            unsafe {
+                ws_close_fd(this.socket)
+            }
             this.socket = 0
         }
         this.open = false
     }
 
-    /// Best-effort send via string-based `net.send`.
-    /// Arbitrary binary frame bytes (>127) cannot be transported by this path.
+    /// Send raw frame bytes over the socket (byte-safe).
     fun transmit_bytes(view array[int] data) -> bool {
         if (!this.open || this.socket <= 0) { return false }
-        var chunk = ""
         var count = arrays.length(data)
         for (var i = 0; i < count; i = i + 1) {
             var b = arrays.get(data, i) & 255
-            if (b <= 127) {
-                chunk = chunk + strings.from_char_code(b)
-                if (strings.length(chunk) >= 512) {
-                    try { net.send(this.socket, chunk) } catch (err) {
-                        this.last_error = err
-                        return false
-                    }
-                    chunk = ""
-                }
-            } else {
-                this.last_error = "binary frame bytes require byte-safe socket transport"
-                return false
+            var sent = -1
+            unsafe {
+                sent = ws_send_byte(this.socket, b)
             }
-        }
-        if (!strings.is_empty(chunk)) {
-            try { net.send(this.socket, chunk) } catch (err) {
-                this.last_error = err
+            if (sent <= 0) {
+                this.last_error = "send failed"
                 return false
             }
         }
@@ -744,19 +741,29 @@ class Connection {
 
     fun pump(int max_bytes) -> bool {
         if (!this.open || this.socket <= 0) { return false }
-        try {
-            var chunk = net.recv(this.socket, max_bytes)
-            if (strings.is_empty(chunk)) { return false }
-            var length = strings.length(chunk)
-            for (var i = 0; i < length; i = i + 1) {
-                var b = strings.char_code(chunk, i)
-                if (b >= 0) { arrays.push(this.recv_buffer, b & 255) }
+        var limit = max_bytes
+        if (limit <= 0) { limit = 4096 }
+        var got_any = false
+        for (var i = 0; i < limit; i = i + 1) {
+            var b = -2
+            unsafe {
+                b = ws_recv_byte(this.socket)
             }
-            return true
-        } catch (err) {
-            this.last_error = err
-            return false
+            if (b >= 0) {
+                arrays.push(this.recv_buffer, b & 255)
+                got_any = true
+            } elif (b == -2) {
+                // timeout/would-block
+                if (got_any) { return true }
+                return false
+            } else {
+                // EOF or error
+                if (got_any) { return true }
+                this.open = false
+                return false
+            }
         }
+        return got_any
     }
 
     /// Decode the next buffered frame into `out_frame`. Returns true on success.
@@ -844,14 +851,104 @@ fun parse_url(view string url) -> Url {
     return Url(host, port, path, secure)
 }
 
+fun parse_ipv4(view string host) -> array[int] {
+    var array[int] parts = []
+    var current = 0
+    var has_digit = false
+    var length = strings.length(host)
+    for (var i = 0; i < length; i = i + 1) {
+        var code = strings.char_code(host, i)
+        if (code >= 48 && code <= 57) {
+            current = current * 10 + (code - 48)
+            has_digit = true
+        } elif (code == 46) {
+            if (!has_digit) { throw "websocket: invalid IPv4 address" }
+            arrays.push(parts, current)
+            current = 0
+            has_digit = false
+        } else {
+            throw "websocket: invalid IPv4 address"
+        }
+    }
+    if (!has_digit) { throw "websocket: invalid IPv4 address" }
+    arrays.push(parts, current)
+    if (arrays.length(parts) != 4) { throw "websocket: invalid IPv4 address" }
+    return parts
+}
+
+fun resolve_socket(view string host, int port) -> int {
+    if (host == "localhost") {
+        var fd = -1
+        unsafe { fd = ws_tcp_connect_localhost(port) }
+        if (fd < 0) { throw "websocket.connect: cannot connect to localhost" }
+        return fd
+    }
+    // Try numeric IPv4 first
+    var is_ip = true
+    var length = strings.length(host)
+    if (length == 0) { is_ip = false }
+    for (var i = 0; i < length; i = i + 1) {
+        var code = strings.char_code(host, i)
+        if (!((code >= 48 && code <= 57) || code == 46)) {
+            is_ip = false
+        }
+    }
+    if (is_ip) {
+        var octets = parse_ipv4(host)
+        var fd = -1
+        unsafe {
+            fd = ws_tcp_connect_ip(arrays.get(octets, 0), arrays.get(octets, 1), arrays.get(octets, 2), arrays.get(octets, 3), port)
+        }
+        if (fd < 0) { throw "websocket.connect: cannot connect to " + copy(host) }
+        return fd
+    }
+    // Resolve hostname via C helper (DNS)
+    var fd = -1
+    unsafe {
+        ws_host_reset()
+        for (var i = 0; i < length; i = i + 1) {
+            var code = strings.char_code(host, i)
+            if (code >= 0) { ws_host_append(code & 255) }
+        }
+        fd = ws_host_connect(port)
+    }
+    if (fd < 0) { throw "websocket.connect: cannot connect to " + copy(host) }
+    return fd
+}
+
+fun send_text_bytes(int socket, view string text) -> bool {
+    var length = strings.length(text)
+    for (var i = 0; i < length; i = i + 1) {
+        var b = strings.char_code(text, i)
+        if (b < 0) { b = 63 }
+        var sent = -1
+        unsafe { sent = ws_send_byte(socket, b & 255) }
+        if (sent <= 0) { return false }
+    }
+    return true
+}
+
 fun read_http_response(int socket) -> string {
     var response = ""
-    for (var i = 0; i < 64; i = i + 1) {
-        var chunk = ""
-        try { chunk = net.recv(socket, 1024) } catch (_) { break }
-        if (strings.is_empty(chunk)) { break }
-        response = response + chunk
-        if (strings.contains(response, "\r\n\r\n") || strings.contains(response, "\n\n")) { break }
+    var max_bytes = 65536
+    for (var i = 0; i < max_bytes; i = i + 1) {
+        var b = -2
+        unsafe { b = ws_recv_byte(socket) }
+        if (b >= 0) {
+            if (b <= 127) {
+                response = response + strings.from_char_code(b)
+            } else {
+                response = response + "?"
+            }
+            if (strings.contains(response, "\r\n\r\n") || strings.contains(response, "\n\n")) {
+                break
+            }
+        } elif (b == -2) {
+            // timeout
+            break
+        } else {
+            break
+        }
     }
     return response
 }
@@ -861,19 +958,22 @@ fun connect(view string url) -> Connection {
     var parsed = parse_url(url)
     if (parsed.secure) { throw "websocket.connect: wss:// requires TLS transport support" }
 
-    var socket = net.tcp_connect(parsed.host, parsed.port)
+    var socket = resolve_socket(parsed.host, parsed.port)
     var key = make_key()
     var request = build_upgrade_request(parsed.host + ":" + int_to_string(parsed.port), parsed.path, key)
-    net.send(socket, request)
+    if (!send_text_bytes(socket, request)) {
+        unsafe { ws_close_fd(socket) }
+        throw "websocket.connect: failed to send handshake request"
+    }
 
     var response = read_http_response(socket)
     if (!is_upgrade_response(response)) {
-        net.close(socket)
+        unsafe { ws_close_fd(socket) }
         throw "websocket.connect: server did not accept WebSocket upgrade"
     }
     var accept = header_value(response, "Sec-WebSocket-Accept")
     if (!strings.is_empty(accept) && !validate_accept(key, accept)) {
-        net.close(socket)
+        unsafe { ws_close_fd(socket) }
         throw "websocket.connect: invalid Sec-WebSocket-Accept"
     }
 
