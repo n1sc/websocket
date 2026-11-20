@@ -1,0 +1,5 @@
+[package]
+name = "websocket"
+entry = "src/lib.nt"
+output = "websocket"
+compiler = "^0.1"

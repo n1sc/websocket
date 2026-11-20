@@ -1,0 +1,124 @@
+# websocket
+
+WebSocket protocol support for Neutron.
+
+Implements the RFC 6455 protocol core in pure Neutron: opening handshake,
+SHA-1/Base64 accept calculation, frame encoding/decoding, masking, and a
+`ws://` client connection API.
+
+## Install
+
+```console
+ntsc pkg install websocket
+```
+
+```nt
+use websocket
+```
+
+## Features
+
+- **Handshake**: `Sec-WebSocket-Key` generation, `Sec-WebSocket-Accept`
+  computation/validation, HTTP upgrade request building and response parsing
+- **Crypto primitives**: pure-Neutron SHA-1 and Base64 (byte-array APIs)
+- **Framing**: encode/decode RFC 6455 frames (FIN, opcode, masking, payload
+  lengths 7/16/64-bit), helpers for text/binary/close/ping/pong messages
+- **Client**: `ws://` URL parsing and TCP connect + opening handshake
+- **Byte-level APIs**: protocol operations work on `array[int]` byte buffers
+  (values 0-255) using explicit integer/bitwise manipulation
+
+## API overview
+
+### Handshake
+
+- `make_key() -> string`
+- `accept_key(view string key) -> string`
+- `validate_accept(view string key, view string accept) -> bool`
+- `build_upgrade_request(view string host, view string path, view string key) -> string`
+- `is_upgrade_response(view string response) -> bool`
+- `header_value(view string response, view string name) -> string`
+
+### Frames
+
+- `text_message(view string text, view array[int] masking_key) -> array[int]`
+- `binary_message_hex(view string hex, view array[int] masking_key) -> array[int]`
+- `close_message(int code, view string reason, view array[int] masking_key) -> array[int]`
+- `ping_message(view array[int] payload, view array[int] masking_key) -> array[int]`
+- `pong_message(view array[int] payload, view array[int] masking_key) -> array[int]`
+- `encode(view Frame value) -> array[int]`
+- `decode(view array[int] data, int offset) -> DecodeResult`
+- `apply_mask(view array[int] payload, view array[int] masking_key) -> array[int]`
+- `random_mask() -> array[int]`
+
+Types: `Frame`, `DecodeResult`, `Url`, `Connection`.
+
+### Client
+
+- `parse_url(view string url) -> Url`
+- `connect(view string url) -> Connection`
+
+`Connection` methods include `send_text`, `send_binary_hex`, `send_ping`,
+`send_pong`, `send_close`, `pump`, `receive_frame`, `transmit_bytes`,
+`close_socket`.
+
+### Utilities
+
+- `sha1_hex(view string text) -> string`
+- `sha1_bytes(view array[int] data) -> array[int]`
+- `base64_encode_bytes(view array[int] data) -> string`
+- `base64_decode_bytes(view string text) -> array[int]`
+- `string_to_bytes(view string text) -> array[int]`
+- `bytes_to_hex(view array[int] data) -> string`
+- `hex_to_bytes(view string text) -> array[int]`
+
+## Example
+
+```nt
+use arrays
+use websocket
+
+fun main() {
+    // Handshake / protocol primitives
+    var key = "dGhlIHNhbXBsZSBub25jZQ=="
+    say(websocket.accept_key(key))
+    // s3pPLMBiTxaQ9kYGzzhZRbK+xOo=
+
+    // Encode and decode a masked text frame
+    var mask = [1, 2, 3, 4]
+    var wire = websocket.text_message("Hello", mask)
+    var decoded = websocket.decode(wire, 0)
+    if (decoded.ok && decoded.frame.is_text()) {
+        say(decoded.frame.payload_text())
+    }
+
+    // Connect to a ws:// endpoint (network required)
+    // var conn = websocket.connect("ws://127.0.0.1:8080/chat")
+    // conn.send_text("hello")
+    // var out = websocket.empty_frame()
+    // if (conn.pump(4096) && conn.receive_frame(out)) { say(out.payload_text()) }
+    // conn.send_close(1000, "bye")
+}
+```
+
+## Transport limitations
+
+This module targets the current Neutron runtime without compiler/runtime
+modifications.
+
+- **`wss://` (TLS)** is not supported by the `connect` helper.
+- Network transport uses the string-based `net` API. `Connection.transmit_bytes`
+  rejects frame bytes with values > 127 and reports an error via
+  `conn.last_error`, because arbitrary binary bytes cannot be sent safely
+  through string-based socket I/O. As a result, most masked client-to-server
+  frames (whose XORed wire bytes commonly include values > 127) cannot be
+  transmitted over this path in the current runtime.
+- `pump` reads string data from `net.recv` and converts by character code;
+  binary/non-text payloads received from the network may not round-trip
+  faithfully.
+
+The protocol core (handshake computation, frame construction/parsing, masking,
+SHA-1/Base64) is fully implemented and tested over in-memory byte arrays.
+
+## License
+
+Neutron Permissive License (NPL) 1.1
