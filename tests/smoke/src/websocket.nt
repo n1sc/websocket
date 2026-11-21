@@ -1,0 +1,1113 @@
+//! WebSocket protocol support for Neutron.
+//!
+//! Provides RFC 6455 handshake helpers, frame encoding/decoding, and a TCP
+//! client for `ws://` endpoints. The protocol core operates on byte arrays
+//! (`array[int]`, values 0-255).
+
+use arrays
+use crypto
+use strings
+use testing
+
+extern "C" fun ws_host_reset()
+extern "C" fun ws_host_append(int ch)
+extern "C" fun ws_host_connect(int port) -> int
+extern "C" fun ws_tcp_connect_ip(int a, int b, int c, int d, int port) -> int
+extern "C" fun ws_tcp_connect_localhost(int port) -> int
+extern "C" fun ws_send_byte(int fd, int value) -> int
+extern "C" fun ws_recv_byte(int fd) -> int
+extern "C" fun ws_poll_read(int fd, int timeout_ms) -> int
+extern "C" fun ws_set_recv_timeout(int fd, int timeout_ms) -> int
+extern "C" fun ws_close_fd(int fd) -> int
+
+// ── Byte helpers ───────────────────────────────────────────────────────────
+
+fun byte_hex_digit(int value) -> string {
+    if (value < 10) { return strings.from_char_code(48 + value) }
+    return strings.from_char_code(87 + value)
+}
+
+fun byte_hex_value(int code) -> int {
+    if (code >= 48 && code <= 57) { return code - 48 }
+    if (code >= 65 && code <= 70) { return code - 55 }
+    if (code >= 97 && code <= 102) { return code - 87 }
+    return -1
+}
+
+fun string_to_bytes(view string text) -> array[int] {
+    var array[int] out = []
+    var length = strings.length(text)
+    for (var i = 0; i < length; i = i + 1) {
+        var b = strings.char_code(text, i)
+        if (b >= 0) { arrays.push(out, b & 255) }
+    }
+    return out
+}
+
+fun bytes_to_hex(view array[int] data) -> string {
+    var out = ""
+    var count = arrays.length(data)
+    for (var i = 0; i < count; i = i + 1) {
+        var b = arrays.get(data, i) & 255
+        out = out + byte_hex_digit((b >> 4) & 15) + byte_hex_digit(b & 15)
+    }
+    return out
+}
+
+fun hex_to_bytes(view string text) -> array[int] {
+    var array[int] out = []
+    var i = 0
+    var length = strings.length(text)
+    while (i + 1 < length) {
+        var hi = byte_hex_value(strings.char_code(text, i))
+        var lo = byte_hex_value(strings.char_code(text, i + 1))
+        if (hi >= 0 && lo >= 0) {
+            arrays.push(out, (hi << 4) | lo)
+        }
+        i = i + 2
+    }
+    return out
+}
+
+fun bytes_slice(view array[int] data, int start, int end) -> array[int] {
+    var array[int] out = []
+    var count = arrays.length(data)
+    var s = start
+    var e = end
+    if (s < 0) { s = 0 }
+    if (e > count) { e = count }
+    for (var i = s; i < e; i = i + 1) {
+        arrays.push(out, arrays.get(data, i) & 255)
+    }
+    return out
+}
+
+fun codepoint_to_string(int cp) -> string {
+    if (cp <= 127) { return strings.from_char_code(cp) }
+    return "?"
+}
+
+fun bytes_to_string_lossy(view array[int] data) -> string {
+    var out = ""
+    var i = 0
+    var count = arrays.length(data)
+    while (i < count) {
+        var b0 = arrays.get(data, i) & 255
+        if (b0 < 128) {
+            out = out + strings.from_char_code(b0)
+            i = i + 1
+        } elif (b0 >= 194 && b0 <= 223 && i + 1 < count) {
+            var b1 = arrays.get(data, i + 1) & 255
+            if ((b1 & 192) == 128) {
+                var cp = ((b0 & 31) << 6) | (b1 & 63)
+                out = out + codepoint_to_string(cp)
+                i = i + 2
+            } else {
+                out = out + "?"
+                i = i + 1
+            }
+        } elif (b0 >= 224 && b0 <= 239 && i + 2 < count) {
+            var b1 = arrays.get(data, i + 1) & 255
+            var b2 = arrays.get(data, i + 2) & 255
+            if ((b1 & 192) == 128 && (b2 & 192) == 128) {
+                var cp = ((b0 & 15) << 12) | ((b1 & 63) << 6) | (b2 & 63)
+                out = out + codepoint_to_string(cp)
+                i = i + 3
+            } else {
+                out = out + "?"
+                i = i + 1
+            }
+        } elif (b0 >= 240 && b0 <= 244 && i + 3 < count) {
+            var b1 = arrays.get(data, i + 1) & 255
+            var b2 = arrays.get(data, i + 2) & 255
+            var b3 = arrays.get(data, i + 3) & 255
+            if ((b1 & 192) == 128 && (b2 & 192) == 128 && (b3 & 192) == 128) {
+                var cp = ((b0 & 7) << 18) | ((b1 & 63) << 12) | ((b2 & 63) << 6) | (b3 & 63)
+                out = out + codepoint_to_string(cp)
+                i = i + 4
+            } else {
+                out = out + "?"
+                i = i + 1
+            }
+        } else {
+            out = out + "?"
+            i = i + 1
+        }
+    }
+    return out
+}
+
+// ── SHA-1 ──────────────────────────────────────────────────────────────────
+
+fun sha1_left_rotate(int value, int amount) -> int {
+    var v = value & 4294967295
+    var a = amount & 31
+    var left = (v << a) & 4294967295
+    var right = (v >> (32 - a)) & 4294967295
+    return (left | right) & 4294967295
+}
+
+fun sha1_u32_not(int value) -> int {
+    return (4294967295 ^ (value & 4294967295)) & 4294967295
+}
+
+fun sha1_u32_add(int a, int b) -> int {
+    return (a + b) & 4294967295
+}
+
+fun sha1_u32_add5(int a, int b, int c, int d, int e) -> int {
+    return (a + b + c + d + e) & 4294967295
+}
+
+/// SHA-1 digest of `data` (each element 0-255), returned as 20 bytes.
+fun sha1_bytes(view array[int] data) -> array[int] {
+    var length = arrays.length(data)
+    var bit_len = length * 8
+
+    var array[int] msg = []
+    for (var i = 0; i < length; i = i + 1) {
+        arrays.push(msg, arrays.get(data, i) & 255)
+    }
+    arrays.push(msg, 128)
+    while ((arrays.length(msg) % 64) != 56) {
+        arrays.push(msg, 0)
+    }
+    arrays.push(msg, 0)
+    arrays.push(msg, 0)
+    arrays.push(msg, 0)
+    arrays.push(msg, 0)
+    arrays.push(msg, (bit_len >> 24) & 255)
+    arrays.push(msg, (bit_len >> 16) & 255)
+    arrays.push(msg, (bit_len >> 8) & 255)
+    arrays.push(msg, bit_len & 255)
+
+    var h0 = 1732584193
+    var h1 = 4023233417
+    var h2 = 2562383102
+    var h3 = 271733878
+    var h4 = 3285377520
+
+    var chunks = arrays.length(msg) / 64
+    for (var c = 0; c < chunks; c = c + 1) {
+        var base = c * 64
+        var array[int] w = []
+        for (var i = 0; i < 16; i = i + 1) {
+            var j = base + i * 4
+            var word = ((arrays.get(msg, j) & 255) << 24)
+                | ((arrays.get(msg, j + 1) & 255) << 16)
+                | ((arrays.get(msg, j + 2) & 255) << 8)
+                | (arrays.get(msg, j + 3) & 255)
+            arrays.push(w, word & 4294967295)
+        }
+        for (var i = 16; i < 80; i = i + 1) {
+            var x = (arrays.get(w, i - 3) ^ arrays.get(w, i - 8) ^ arrays.get(w, i - 14) ^ arrays.get(w, i - 16)) & 4294967295
+            arrays.push(w, sha1_left_rotate(x, 1))
+        }
+
+        var a = h0
+        var b = h1
+        var c2 = h2
+        var d = h3
+        var e = h4
+
+        for (var i = 0; i < 80; i = i + 1) {
+            var f = 0
+            var k = 0
+            if (i < 20) {
+                f = (b & c2) | (sha1_u32_not(b) & d)
+                k = 1518500249
+            } elif (i < 40) {
+                f = b ^ c2 ^ d
+                k = 1859775393
+            } elif (i < 60) {
+                f = (b & c2) | (b & d) | (c2 & d)
+                k = 2400959708
+            } else {
+                f = b ^ c2 ^ d
+                k = 3395469782
+            }
+            var temp = sha1_u32_add5(sha1_left_rotate(a, 5), f & 4294967295, e, arrays.get(w, i), k)
+            e = d
+            d = c2
+            c2 = sha1_left_rotate(b, 30)
+            b = a
+            a = temp
+        }
+
+        h0 = sha1_u32_add(h0, a)
+        h1 = sha1_u32_add(h1, b)
+        h2 = sha1_u32_add(h2, c2)
+        h3 = sha1_u32_add(h3, d)
+        h4 = sha1_u32_add(h4, e)
+    }
+
+    var array[int] words = []
+    arrays.push(words, h0)
+    arrays.push(words, h1)
+    arrays.push(words, h2)
+    arrays.push(words, h3)
+    arrays.push(words, h4)
+    var array[int] out = []
+    var wcount = arrays.length(words)
+    for (var i = 0; i < wcount; i = i + 1) {
+        var wv = arrays.get(words, i) & 4294967295
+        arrays.push(out, (wv >> 24) & 255)
+        arrays.push(out, (wv >> 16) & 255)
+        arrays.push(out, (wv >> 8) & 255)
+        arrays.push(out, wv & 255)
+    }
+    return out
+}
+
+/// SHA-1 of a string's byte values, as a lowercase hex string.
+fun sha1_hex(view string text) -> string {
+    var bytes = string_to_bytes(text)
+    return bytes_to_hex(sha1_bytes(bytes))
+}
+
+// ── Base64 ─────────────────────────────────────────────────────────────────
+
+fun base64_alphabet_char(int index) -> string {
+    if (index < 26) { return strings.from_char_code(65 + index) }
+    if (index < 52) { return strings.from_char_code(97 + (index - 26)) }
+    if (index < 62) { return strings.from_char_code(48 + (index - 52)) }
+    if (index == 62) { return "+" }
+    return "/"
+}
+
+fun base64_encode_bytes(view array[int] data) -> string {
+    var out = ""
+    var count = arrays.length(data)
+    var i = 0
+    while (i < count) {
+        var b0 = arrays.get(data, i) & 255
+        var b1 = 0
+        var b2 = 0
+        var remaining = count - i
+        if (remaining > 1) { b1 = arrays.get(data, i + 1) & 255 }
+        if (remaining > 2) { b2 = arrays.get(data, i + 2) & 255 }
+
+        var n = (b0 << 16) | (b1 << 8) | b2
+        out = out + base64_alphabet_char((n >> 18) & 63)
+        out = out + base64_alphabet_char((n >> 12) & 63)
+        if (remaining > 1) {
+            out = out + base64_alphabet_char((n >> 6) & 63)
+        } else {
+            out = out + "="
+        }
+        if (remaining > 2) {
+            out = out + base64_alphabet_char(n & 63)
+        } else {
+            out = out + "="
+        }
+        i = i + 3
+    }
+    return out
+}
+
+fun base64_decode_index(int code) -> int {
+    if (code >= 65 && code <= 90) { return code - 65 }
+    if (code >= 97 && code <= 122) { return code - 71 }
+    if (code >= 48 && code <= 57) { return code + 4 }
+    if (code == 43) { return 62 }
+    if (code == 47) { return 63 }
+    if (code == 61) { return -2 }
+    return -1
+}
+
+fun base64_decode_bytes(view string text) -> array[int] {
+    var array[int] out = []
+    var length = strings.length(text)
+    var quartet = [0, 0, 0, 0]
+    var q = 0
+    for (var i = 0; i < length; i = i + 1) {
+        var code = strings.char_code(text, i)
+        if (code < 0) { continue }
+        if (code == 32 || code == 10 || code == 13 || code == 9) { continue }
+        var value = base64_decode_index(code)
+        if (value == -1) { throw "websocket.base64: invalid character" }
+        quartet[q] = value
+        q = q + 1
+        if (q == 4) {
+            var v0 = quartet[0]
+            var v1 = quartet[1]
+            var v2 = quartet[2]
+            var v3 = quartet[3]
+            var n = (v0 << 18) | ((v1 & 63) << 12)
+            arrays.push(out, (n >> 16) & 255)
+            if (v2 != -2) {
+                n = n | ((v2 & 63) << 6)
+                arrays.push(out, (n >> 8) & 255)
+            }
+            if (v3 != -2) {
+                n = n | (v3 & 63)
+                arrays.push(out, n & 255)
+            }
+            q = 0
+        }
+    }
+    if (q != 0) { throw "websocket.base64: invalid length" }
+    return out
+}
+
+// ── Handshake ──────────────────────────────────────────────────────────────
+
+fun make_key() -> string {
+    var hex = crypto.random_bytes(16)
+    var raw = hex_to_bytes(hex)
+    while (arrays.length(raw) < 16) {
+        arrays.push(raw, 0)
+    }
+    var key_bytes = bytes_slice(raw, 0, 16)
+    return base64_encode_bytes(key_bytes)
+}
+
+fun accept_key(view string key) -> string {
+    var source = copy(key) + "258EAFA5-E914-47DA-95CA-C5AB0DC85B11"
+    var digest = sha1_bytes(string_to_bytes(source))
+    return base64_encode_bytes(digest)
+}
+
+fun validate_accept(view string key, view string accept) -> bool {
+    return accept_key(key) == strings.trim(accept)
+}
+
+fun build_upgrade_request(view string host, view string path, view string key) -> string {
+    var req = "GET " + copy(path) + " HTTP/1.1\r\n"
+    req = req + "Host: " + copy(host) + "\r\n"
+    req = req + "Upgrade: websocket\r\n"
+    req = req + "Connection: Upgrade\r\n"
+    req = req + "Sec-WebSocket-Key: " + copy(key) + "\r\n"
+    req = req + "Sec-WebSocket-Version: 13\r\n"
+    req = req + "\r\n"
+    return req
+}
+
+fun header_value(view string response, view string name) -> string {
+    var needle = strings.lower(name) + ":"
+    var lower = strings.lower(response)
+    var pos = strings.index_of(lower, needle, 0)
+    if (pos < 0) { return "" }
+    var start = pos + strings.length(needle)
+    var end = strings.index_of(response, "\r\n", start)
+    if (end < 0) { end = strings.index_of(response, "\n", start) }
+    if (end < 0) { end = strings.length(response) }
+    return strings.trim(strings.substring(response, start, end))
+}
+
+fun is_upgrade_response(view string response) -> bool {
+    var lower = strings.lower(response)
+    if (strings.index_of(lower, " 101 ", 0) < 0 && strings.index_of(lower, " 101\r", 0) < 0) {
+        return false
+    }
+    var upgrade = strings.lower(header_value(response, "Upgrade"))
+    var connection = strings.lower(header_value(response, "Connection"))
+    return strings.contains(upgrade, "websocket") && strings.contains(connection, "upgrade")
+}
+
+// ── Opcodes ────────────────────────────────────────────────────────────────
+
+fun opcode_continuation() -> int { return 0 }
+fun opcode_text() -> int { return 1 }
+fun opcode_binary() -> int { return 2 }
+fun opcode_close() -> int { return 8 }
+fun opcode_ping() -> int { return 9 }
+fun opcode_pong() -> int { return 10 }
+
+// ── Types ──────────────────────────────────────────────────────────────────
+
+class Frame {
+    var bool fin
+    var int opcode
+    var bool masked
+    var array[int] masking_key
+    var array[int] payload
+
+    fun init(bool fin, int opcode, bool masked, view array[int] masking_key, view array[int] payload) {
+        this.fin = fin
+        this.opcode = opcode & 15
+        this.masked = masked
+        this.masking_key = []
+        var key_len = arrays.length(masking_key)
+        for (var i = 0; i < key_len; i = i + 1) {
+            arrays.push(this.masking_key, arrays.get(masking_key, i) & 255)
+        }
+        if (arrays.length(this.masking_key) != 4) {
+            this.masking_key = [0, 0, 0, 0]
+        }
+        this.payload = []
+        var payload_len = arrays.length(payload)
+        for (var i = 0; i < payload_len; i = i + 1) {
+            arrays.push(this.payload, arrays.get(payload, i) & 255)
+        }
+    }
+
+    fun payload_text() -> string { return bytes_to_string_lossy(this.payload) }
+    fun payload_hex() -> string { return bytes_to_hex(this.payload) }
+    fun is_text() -> bool { return this.opcode == 1 }
+    fun is_binary() -> bool { return this.opcode == 2 }
+    fun is_close() -> bool { return this.opcode == 8 }
+    fun is_ping() -> bool { return this.opcode == 9 }
+    fun is_pong() -> bool { return this.opcode == 10 }
+    fun is_control() -> bool { return this.opcode >= 8 }
+}
+
+class DecodeResult {
+    var bool ok
+    var int consumed
+    var Frame frame
+    var string error
+
+    fun init(bool ok, int consumed, view Frame frame, view string error) {
+        this.ok = ok
+        this.consumed = consumed
+        this.frame = Frame(frame.fin, frame.opcode, frame.masked, frame.masking_key, frame.payload)
+        this.error = copy(error)
+    }
+}
+
+class Url {
+    var string host
+    var int port
+    var string path
+    var bool secure
+
+    fun init(view string host, int port, view string path, bool secure) {
+        this.host = copy(host)
+        this.port = port
+        this.path = copy(path)
+        this.secure = secure
+    }
+}
+
+fun empty_frame() -> Frame {
+    var array[int] empty = []
+    return Frame(true, 0, false, [0, 0, 0, 0], empty)
+}
+
+fun apply_mask(view array[int] payload, view array[int] masking_key) -> array[int] {
+    var array[int] out = []
+    var count = arrays.length(payload)
+    for (var i = 0; i < count; i = i + 1) {
+        var b = arrays.get(payload, i) & 255
+        var m = arrays.get(masking_key, i % 4) & 255
+        arrays.push(out, (b ^ m) & 255)
+    }
+    return out
+}
+
+fun random_mask() -> array[int] {
+    var hex = crypto.random_bytes(4)
+    var raw = hex_to_bytes(hex)
+    var array[int] mask = []
+    for (var i = 0; i < 4; i = i + 1) {
+        if (i < arrays.length(raw)) {
+            arrays.push(mask, arrays.get(raw, i) & 127)
+        } else {
+            arrays.push(mask, 0)
+        }
+    }
+    return mask
+}
+
+// ── Frame encoding/decoding ────────────────────────────────────────────────
+
+fun encode(view Frame value) -> array[int] {
+    var array[int] out = []
+    var b0 = value.opcode & 15
+    if (value.fin) { b0 = b0 | 128 }
+    arrays.push(out, b0)
+
+    var payload_len = arrays.length(value.payload)
+    var b1 = 0
+    if (value.masked) { b1 = 128 }
+
+    if (payload_len < 126) {
+        arrays.push(out, b1 | payload_len)
+    } elif (payload_len < 65536) {
+        arrays.push(out, b1 | 126)
+        arrays.push(out, (payload_len >> 8) & 255)
+        arrays.push(out, payload_len & 255)
+    } else {
+        arrays.push(out, b1 | 127)
+        arrays.push(out, 0)
+        arrays.push(out, 0)
+        arrays.push(out, 0)
+        arrays.push(out, 0)
+        arrays.push(out, (payload_len >> 24) & 255)
+        arrays.push(out, (payload_len >> 16) & 255)
+        arrays.push(out, (payload_len >> 8) & 255)
+        arrays.push(out, payload_len & 255)
+    }
+
+    var array[int] payload = []
+    if (value.masked) {
+        for (var i = 0; i < 4; i = i + 1) {
+            arrays.push(out, arrays.get(value.masking_key, i) & 255)
+        }
+        payload = apply_mask(value.payload, value.masking_key)
+    } else {
+        var pcount = arrays.length(value.payload)
+        for (var i = 0; i < pcount; i = i + 1) {
+            arrays.push(payload, arrays.get(value.payload, i) & 255)
+        }
+    }
+
+    var count = arrays.length(payload)
+    for (var i = 0; i < count; i = i + 1) {
+        arrays.push(out, arrays.get(payload, i) & 255)
+    }
+    return out
+}
+
+fun decode(view array[int] data, int offset) -> DecodeResult {
+    var total = arrays.length(data)
+    if (total - offset < 2) {
+        var ef = empty_frame()
+        return DecodeResult(false, 0, ef, "incomplete")
+    }
+
+    var b0 = arrays.get(data, offset) & 255
+    var b1 = arrays.get(data, offset + 1) & 255
+    var fin = (b0 & 128) != 0
+    var opcode = b0 & 15
+    var masked = (b1 & 128) != 0
+    var length = b1 & 127
+    var pos = offset + 2
+
+    if (length == 126) {
+        if (total - pos < 2) {
+            var ef = empty_frame()
+            return DecodeResult(false, 0, ef, "incomplete")
+        }
+        length = ((arrays.get(data, pos) & 255) << 8) | (arrays.get(data, pos + 1) & 255)
+        pos = pos + 2
+    } elif (length == 127) {
+        if (total - pos < 8) {
+            var ef = empty_frame()
+            return DecodeResult(false, 0, ef, "incomplete")
+        }
+        length = 0
+        for (var i = 4; i < 8; i = i + 1) {
+            length = (length << 8) | (arrays.get(data, pos + i) & 255)
+        }
+        pos = pos + 8
+    }
+
+    var masking_key = [0, 0, 0, 0]
+    if (masked) {
+        if (total - pos < 4) {
+            var ef = empty_frame()
+            return DecodeResult(false, 0, ef, "incomplete")
+        }
+        masking_key = [
+            arrays.get(data, pos) & 255,
+            arrays.get(data, pos + 1) & 255,
+            arrays.get(data, pos + 2) & 255,
+            arrays.get(data, pos + 3) & 255
+        ]
+        pos = pos + 4
+    }
+
+    if (total - pos < length) {
+        var ef = empty_frame()
+        return DecodeResult(false, 0, ef, "incomplete")
+    }
+
+    var payload = bytes_slice(data, pos, pos + length)
+    if (masked) { payload = apply_mask(payload, masking_key) }
+    pos = pos + length
+
+    var f = Frame(fin, opcode, masked, masking_key, payload)
+    return DecodeResult(true, pos - offset, f, "")
+}
+
+fun text_message(view string text, view array[int] masking_key) -> array[int] {
+    var payload = string_to_bytes(text)
+    var f = Frame(true, 1, true, masking_key, payload)
+    return encode(f)
+}
+
+fun binary_message_hex(view string hex, view array[int] masking_key) -> array[int] {
+    var payload = hex_to_bytes(hex)
+    var f = Frame(true, 2, true, masking_key, payload)
+    return encode(f)
+}
+
+fun close_message(int code, view string reason, view array[int] masking_key) -> array[int] {
+    var array[int] payload = []
+    arrays.push(payload, (code >> 8) & 255)
+    arrays.push(payload, code & 255)
+    var reason_bytes = string_to_bytes(reason)
+    var count = arrays.length(reason_bytes)
+    for (var i = 0; i < count; i = i + 1) {
+        arrays.push(payload, arrays.get(reason_bytes, i) & 255)
+    }
+    var f = Frame(true, 8, true, masking_key, payload)
+    return encode(f)
+}
+
+fun ping_message(view array[int] payload, view array[int] masking_key) -> array[int] {
+    var f = Frame(true, 9, true, masking_key, payload)
+    return encode(f)
+}
+
+fun pong_message(view array[int] payload, view array[int] masking_key) -> array[int] {
+    var f = Frame(true, 10, true, masking_key, payload)
+    return encode(f)
+}
+
+// ── Client / URL ───────────────────────────────────────────────────────────
+
+class Connection {
+    var int socket
+    var bool open
+    var string key
+    var array[int] recv_buffer
+    var string protocol
+    var string last_error
+
+    fun init(int socket, view string key) {
+        this.socket = socket
+        this.open = true
+        this.key = copy(key)
+        this.recv_buffer = []
+        this.protocol = ""
+        this.last_error = ""
+    }
+
+    fun close_socket() {
+        if (this.socket > 0) {
+            unsafe {
+                ws_close_fd(this.socket)
+            }
+            this.socket = 0
+        }
+        this.open = false
+    }
+
+    /// Send raw frame bytes over the socket (byte-safe).
+    fun transmit_bytes(view array[int] data) -> bool {
+        if (!this.open || this.socket <= 0) { return false }
+        var count = arrays.length(data)
+        for (var i = 0; i < count; i = i + 1) {
+            var b = arrays.get(data, i) & 255
+            var sent = -1
+            unsafe {
+                sent = ws_send_byte(this.socket, b)
+            }
+            if (sent <= 0) {
+                this.last_error = "send failed"
+                return false
+            }
+        }
+        return true
+    }
+
+    fun send_text(view string text) -> bool {
+        var mask = random_mask()
+        return this.transmit_bytes(text_message(text, mask))
+    }
+
+    fun send_binary_hex(view string hex) -> bool {
+        var mask = random_mask()
+        return this.transmit_bytes(binary_message_hex(hex, mask))
+    }
+
+    fun send_ping(view string text) -> bool {
+        var mask = random_mask()
+        var payload = string_to_bytes(text)
+        return this.transmit_bytes(ping_message(payload, mask))
+    }
+
+    fun send_pong(view string text) -> bool {
+        var mask = random_mask()
+        var payload = string_to_bytes(text)
+        return this.transmit_bytes(pong_message(payload, mask))
+    }
+
+    fun send_close(int code, view string reason) {
+        if (this.open) {
+            var mask = random_mask()
+            this.transmit_bytes(close_message(code, reason, mask))
+        }
+        this.close_socket()
+    }
+
+    /// Poll the socket for readability. timeout_ms: 0 = non-blocking, >0 = wait.
+    fun poll(int timeout_ms) -> bool {
+        if (!this.open || this.socket <= 0) { return false }
+        var ready = 0
+        unsafe { ready = ws_poll_read(this.socket, timeout_ms) }
+        return ready == 1
+    }
+
+    /// Set the socket receive timeout in milliseconds for blocking reads.
+    /// A value of 0 uses the OS default (no receive timeout).
+    fun set_recv_timeout(int timeout_ms) -> bool {
+        if (this.socket <= 0) { return false }
+        var rc = -1
+        unsafe { rc = ws_set_recv_timeout(this.socket, timeout_ms) }
+        return rc == 0
+    }
+
+    /// Read available bytes without blocking (polls with timeout 0 before reads).
+    fun pump_nonblocking(int max_bytes) -> bool {
+        if (!this.open || this.socket <= 0) { return false }
+        var limit = max_bytes
+        if (limit <= 0) { limit = 4096 }
+        if (!this.poll(0)) { return false }
+        var got_any = false
+        for (var i = 0; i < limit; i = i + 1) {
+            if (i > 0 && !this.poll(0)) { break }
+            var b = -2
+            unsafe { b = ws_recv_byte(this.socket) }
+            if (b >= 0) {
+                arrays.push(this.recv_buffer, b & 255)
+                got_any = true
+            } elif (b == -2) {
+                break
+            } else {
+                if (!got_any) { this.open = false }
+                break
+            }
+        }
+        return got_any
+    }
+
+    fun pump(int max_bytes) -> bool {
+        if (!this.open || this.socket <= 0) { return false }
+        var limit = max_bytes
+        if (limit <= 0) { limit = 4096 }
+        var got_any = false
+        for (var i = 0; i < limit; i = i + 1) {
+            var b = -2
+            unsafe {
+                b = ws_recv_byte(this.socket)
+            }
+            if (b >= 0) {
+                arrays.push(this.recv_buffer, b & 255)
+                got_any = true
+            } elif (b == -2) {
+                // timeout/would-block
+                if (got_any) { return true }
+                return false
+            } else {
+                // EOF or error
+                if (got_any) { return true }
+                this.open = false
+                return false
+            }
+        }
+        return got_any
+    }
+
+    /// Decode the next buffered frame into `out_frame`. Returns true on success.
+    fun receive_frame(view mut Frame out_frame) -> bool {
+        var decoded = decode(this.recv_buffer, 0)
+        if (decoded.ok) {
+            out_frame.fin = decoded.frame.fin
+            out_frame.opcode = decoded.frame.opcode
+            out_frame.masked = decoded.frame.masked
+            out_frame.masking_key = decoded.frame.masking_key
+            out_frame.payload = decoded.frame.payload
+            var array[int] remaining = []
+            var total = arrays.length(this.recv_buffer)
+            for (var i = decoded.consumed; i < total; i = i + 1) {
+                arrays.push(remaining, arrays.get(this.recv_buffer, i) & 255)
+            }
+            this.recv_buffer = remaining
+            return true
+        }
+        return false
+    }
+}
+
+fun parse_int(view string text) -> int {
+    var value = 0
+    var length = strings.length(text)
+    for (var i = 0; i < length; i = i + 1) {
+        var code = strings.char_code(text, i)
+        if (code >= 48 && code <= 57) { value = value * 10 + (code - 48) }
+    }
+    return value
+}
+
+fun int_to_string(int value) -> string {
+    if (value == 0) { return "0" }
+    var n = value
+    var negative = false
+    if (n < 0) { negative = true; n = 0 - n }
+    var digits = ""
+    while (n > 0) {
+        var digit = n % 10
+        digits = strings.from_char_code(48 + digit) + digits
+        n = n / 10
+    }
+    if (negative) { return "-" + digits }
+    return digits
+}
+
+fun parse_url(view string url) -> Url {
+    var rest = copy(url)
+    var secure = false
+    if (strings.starts_with(rest, "wss://")) {
+        secure = true
+        rest = strings.substring(rest, 6, -1)
+    } elif (strings.starts_with(rest, "ws://")) {
+        secure = false
+        rest = strings.substring(rest, 5, -1)
+    } elif (strings.starts_with(rest, "http://")) {
+        secure = false
+        rest = strings.substring(rest, 7, -1)
+    } elif (strings.starts_with(rest, "https://")) {
+        secure = true
+        rest = strings.substring(rest, 8, -1)
+    }
+
+    var path = "/"
+    var slash = strings.index_of(copy(rest), "/", 0)
+    var hostport = copy(rest)
+    if (slash >= 0) {
+        hostport = strings.substring(copy(rest), 0, slash)
+        path = strings.substring(rest, slash, -1)
+        if (strings.is_empty(path)) { path = "/" }
+    }
+
+    var host = copy(hostport)
+    var port = 80
+    if (secure) { port = 443 }
+    var colon = strings.index_of(copy(hostport), ":", 0)
+    if (colon >= 0) {
+        host = strings.substring(copy(hostport), 0, colon)
+        var port_text = strings.substring(hostport, colon + 1, -1)
+        if (!strings.is_empty(port_text)) { port = parse_int(port_text) }
+    }
+    if (strings.is_empty(host)) { throw "websocket: missing host in URL" }
+    return Url(host, port, path, secure)
+}
+
+fun parse_ipv4(view string host) -> array[int] {
+    var array[int] parts = []
+    var current = 0
+    var has_digit = false
+    var length = strings.length(host)
+    for (var i = 0; i < length; i = i + 1) {
+        var code = strings.char_code(host, i)
+        if (code >= 48 && code <= 57) {
+            current = current * 10 + (code - 48)
+            has_digit = true
+        } elif (code == 46) {
+            if (!has_digit) { throw "websocket: invalid IPv4 address" }
+            arrays.push(parts, current)
+            current = 0
+            has_digit = false
+        } else {
+            throw "websocket: invalid IPv4 address"
+        }
+    }
+    if (!has_digit) { throw "websocket: invalid IPv4 address" }
+    arrays.push(parts, current)
+    if (arrays.length(parts) != 4) { throw "websocket: invalid IPv4 address" }
+    return parts
+}
+
+fun resolve_socket(view string host, int port) -> int {
+    if (host == "localhost") {
+        var fd = -1
+        unsafe { fd = ws_tcp_connect_localhost(port) }
+        if (fd < 0) { throw "websocket.connect: cannot connect to localhost" }
+        return fd
+    }
+    // Try numeric IPv4 first
+    var is_ip = true
+    var length = strings.length(host)
+    if (length == 0) { is_ip = false }
+    for (var i = 0; i < length; i = i + 1) {
+        var code = strings.char_code(host, i)
+        if (!((code >= 48 && code <= 57) || code == 46)) {
+            is_ip = false
+        }
+    }
+    if (is_ip) {
+        var octets = parse_ipv4(host)
+        var fd = -1
+        unsafe {
+            fd = ws_tcp_connect_ip(arrays.get(octets, 0), arrays.get(octets, 1), arrays.get(octets, 2), arrays.get(octets, 3), port)
+        }
+        if (fd < 0) { throw "websocket.connect: cannot connect to " + copy(host) }
+        return fd
+    }
+    // Resolve hostname via C helper (DNS)
+    var fd = -1
+    unsafe {
+        ws_host_reset()
+        for (var i = 0; i < length; i = i + 1) {
+            var code = strings.char_code(host, i)
+            if (code >= 0) { ws_host_append(code & 255) }
+        }
+        fd = ws_host_connect(port)
+    }
+    if (fd < 0) { throw "websocket.connect: cannot connect to " + copy(host) }
+    return fd
+}
+
+fun send_text_bytes(int socket, view string text) -> bool {
+    var length = strings.length(text)
+    for (var i = 0; i < length; i = i + 1) {
+        var b = strings.char_code(text, i)
+        if (b < 0) { b = 63 }
+        var sent = -1
+        unsafe { sent = ws_send_byte(socket, b & 255) }
+        if (sent <= 0) { return false }
+    }
+    return true
+}
+
+fun read_http_response(int socket) -> string {
+    var response = ""
+    var max_bytes = 65536
+    for (var i = 0; i < max_bytes; i = i + 1) {
+        var b = -2
+        unsafe { b = ws_recv_byte(socket) }
+        if (b >= 0) {
+            if (b <= 127) {
+                response = response + strings.from_char_code(b)
+            } else {
+                response = response + "?"
+            }
+            if (strings.contains(response, "\r\n\r\n") || strings.contains(response, "\n\n")) {
+                break
+            }
+        } elif (b == -2) {
+            // timeout
+            break
+        } else {
+            break
+        }
+    }
+    return response
+}
+
+/// Connect to a `ws://` URL and complete the opening handshake.
+fun connect(view string url) -> Connection {
+    var parsed = parse_url(url)
+    if (parsed.secure) { throw "websocket.connect: wss:// requires TLS transport support" }
+
+    var socket = resolve_socket(parsed.host, parsed.port)
+    var key = make_key()
+    var request = build_upgrade_request(parsed.host + ":" + int_to_string(parsed.port), parsed.path, key)
+    if (!send_text_bytes(socket, request)) {
+        unsafe { ws_close_fd(socket) }
+        throw "websocket.connect: failed to send handshake request"
+    }
+
+    var response = read_http_response(socket)
+    if (!is_upgrade_response(response)) {
+        unsafe { ws_close_fd(socket) }
+        throw "websocket.connect: server did not accept WebSocket upgrade"
+    }
+    var accept = header_value(response, "Sec-WebSocket-Accept")
+    if (!strings.is_empty(accept) && !validate_accept(key, accept)) {
+        unsafe { ws_close_fd(socket) }
+        throw "websocket.connect: invalid Sec-WebSocket-Accept"
+    }
+
+    var conn = Connection(socket, key)
+    conn.protocol = header_value(response, "Sec-WebSocket-Protocol")
+    return conn
+}
+
+// ── Tests ──────────────────────────────────────────────────────────────────
+
+test sha1_known_vectors {
+    testing.assert_eq(sha1_hex("abc"), "a9993e364706816aba3e25717850c26c9cd0d89d")
+    testing.assert_eq(sha1_hex(""), "da39a3ee5e6b4b0d3255bfef95601890afd80709")
+}
+
+test websocket_accept_rfc6455 {
+    var key = "dGhlIHNhbXBsZSBub25jZQ=="
+    testing.assert_eq(accept_key(key), "s3pPLMBiTxaQ9kYGzzhZRbK+xOo=")
+    testing.assert_true(validate_accept(key, "s3pPLMBiTxaQ9kYGzzhZRbK+xOo="))
+    testing.assert_false(validate_accept(key, "wrong"))
+}
+
+test base64_roundtrip {
+    var bytes = [72, 101, 108, 108, 111]
+    var encoded = base64_encode_bytes(bytes)
+    testing.assert_eq(encoded, "SGVsbG8=")
+    var decoded = base64_decode_bytes(encoded)
+    testing.assert_eq(arrays.length(decoded), 5)
+    testing.assert_eq(arrays.get(decoded, 0), 72)
+    testing.assert_eq(arrays.get(decoded, 4), 111)
+}
+
+test frame_text_encode_decode_unmasked {
+    var payload = string_to_bytes("Hi")
+    var key = [0, 0, 0, 0]
+    var f = Frame(true, 1, false, key, payload)
+    var wire = encode(f)
+    testing.assert_eq(arrays.length(wire), 4)
+    testing.assert_eq(arrays.get(wire, 0), 129)
+    testing.assert_eq(arrays.get(wire, 1), 2)
+    testing.assert_eq(arrays.get(wire, 2), 72)
+    testing.assert_eq(arrays.get(wire, 3), 105)
+
+    var dr = decode(wire, 0)
+    testing.assert_true(dr.ok)
+    testing.assert_eq(dr.consumed, 4)
+    testing.assert_true(dr.frame.fin)
+    testing.assert_true(dr.frame.is_text())
+    testing.assert_eq(dr.frame.payload_text(), "Hi")
+}
+
+test frame_masked_roundtrip {
+    var key = [1, 2, 3, 4]
+    var wire = text_message("Hello", key)
+    testing.assert_eq(arrays.length(wire), 11)
+    testing.assert_eq(arrays.get(wire, 1) & 128, 128)
+
+    var dr = decode(wire, 0)
+    testing.assert_true(dr.ok)
+    testing.assert_eq(dr.frame.payload_text(), "Hello")
+}
+
+test frame_close_encode_decode {
+    var key = [5, 6, 7, 8]
+    var wire = close_message(1000, "bye", key)
+    var dr = decode(wire, 0)
+    testing.assert_true(dr.ok)
+    testing.assert_true(dr.frame.is_close())
+    testing.assert_eq(arrays.length(dr.frame.payload), 5)
+    testing.assert_eq(arrays.get(dr.frame.payload, 0), 3)
+    testing.assert_eq(arrays.get(dr.frame.payload, 1), 232)
+}
+
+test url_parsing {
+    var u = parse_url("ws://example.com/chat")
+    testing.assert_eq(u.host, "example.com")
+    testing.assert_eq(u.port, 80)
+    testing.assert_eq(u.path, "/chat")
+    testing.assert_false(u.secure)
+
+    var u2 = parse_url("ws://localhost:8080/ws")
+    testing.assert_eq(u2.host, "localhost")
+    testing.assert_eq(u2.port, 8080)
+    testing.assert_eq(u2.path, "/ws")
+
+    var u3 = parse_url("wss://example.com")
+    testing.assert_true(u3.secure)
+    testing.assert_eq(u3.port, 443)
+    testing.assert_eq(u3.path, "/")
+}
+
+test handshake_helpers {
+    var req = build_upgrade_request("example.com", "/chat", "dGhlIHNhbXBsZSBub25jZQ==")
+    testing.assert_true(strings.contains(req, "GET /chat HTTP/1.1"))
+    testing.assert_true(strings.contains(req, "Sec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ=="))
+    testing.assert_true(strings.contains(req, "Upgrade: websocket"))
+
+    var resp = "HTTP/1.1 101 Switching Protocols\r\nUpgrade: websocket\r\nConnection: Upgrade\r\nSec-WebSocket-Accept: s3pPLMBiTxaQ9kYGzzhZRbK+xOo=\r\n\r\n"
+    testing.assert_true(is_upgrade_response(resp))
+    testing.assert_eq(header_value(resp, "Sec-WebSocket-Accept"), "s3pPLMBiTxaQ9kYGzzhZRbK+xOo=")
+}

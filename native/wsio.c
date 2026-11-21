@@ -1,6 +1,8 @@
 #include <arpa/inet.h>
 #include <errno.h>
+#include <fcntl.h>
 #include <netdb.h>
+#include <poll.h>
 #include <stdio.h>
 #include <string.h>
 #include <sys/socket.h>
@@ -116,6 +118,43 @@ int ws_recv_byte(int fd) {
         return -2; /* timeout/would-block */
     }
     return -3; /* error */
+}
+
+int ws_poll_read(int fd, int timeout_ms) {
+    if (fd < 0) {
+        return -1;
+    }
+    struct pollfd pfd;
+    pfd.fd = fd;
+    pfd.events = POLLIN;
+    pfd.revents = 0;
+    int rc = poll(&pfd, 1, timeout_ms);
+    if (rc > 0) {
+        if (pfd.revents & (POLLIN | POLLHUP | POLLERR)) {
+            return 1;
+        }
+        return 0;
+    }
+    if (rc == 0) {
+        return 0;
+    }
+    if (errno == EINTR) {
+        return 0;
+    }
+    return -1;
+}
+
+int ws_set_recv_timeout(int fd, int timeout_ms) {
+    if (fd < 0) {
+        return -1;
+    }
+    struct timeval tv;
+    if (timeout_ms < 0) {
+        timeout_ms = 0;
+    }
+    tv.tv_sec = timeout_ms / 1000;
+    tv.tv_usec = (timeout_ms % 1000) * 1000;
+    return setsockopt(fd, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv));
 }
 
 int ws_close_fd(int fd) {

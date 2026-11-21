@@ -29,6 +29,8 @@ use websocket
   supporting masked client frames and binary payloads
 - **DNS resolution**: hostname resolution supported via the native helper
   (in addition to `localhost` and numeric IPv4 addresses)
+- **Polling/timeouts**: socket readability polling, configurable receive
+  timeout, and non-blocking pump support for event-loop style usage
 - **Byte-level APIs**: protocol operations work on `array[int]` byte buffers
   (values 0-255) using explicit integer/bitwise manipulation
 
@@ -63,7 +65,8 @@ Types: `Frame`, `DecodeResult`, `Url`, `Connection`.
 - `connect(view string url) -> Connection`
 
 `Connection` methods: `send_text`, `send_binary_hex`, `send_ping`, `send_pong`,
-`send_close`, `pump`, `receive_frame`, `transmit_bytes`, `close_socket`.
+`send_close`, `pump`, `pump_nonblocking`, `poll`, `set_recv_timeout`,
+`receive_frame`, `transmit_bytes`, `close_socket`.
 
 ### Utilities
 
@@ -104,17 +107,25 @@ fun main() {
 }
 ```
 
+## Polling and non-blocking reads
+
+- `poll(timeout_ms)` checks socket readability (`0` for immediate/non-blocking).
+- `pump_nonblocking(max_bytes)` reads available bytes without blocking (useful
+  for polling/event loops).
+- `pump(max_bytes)` performs blocking reads according to the socket receive
+  timeout (default set by the native helper); `set_recv_timeout(timeout_ms)`
+  can adjust it.
+- A live end-to-end smoke test (local echo server + client) is included under
+  `tests/smoke/` (`run.sh`).
+
 ## Notes and limitations
 
 - **`wss://` (TLS)** is not supported by `connect`.
 - Transport uses the bundled native FFI helper (`[ffi]` → `native/libwsio.a`)
   for byte-safe TCP I/O. Hostname resolution is supported by the helper; the
   target platform must be able to link against the provided library and libc.
-- `pump` reads byte-by-byte from the socket; the socket receive timeout is set
-  by the native helper, so `pump` may block waiting for data when the buffer is
-  empty (treat as "no frame available yet" in polling loops).
 - Protocol correctness (handshake, framing, masking, SHA-1/Base64) is covered
-  by in-memory tests.
+  by in-memory tests, and end-to-end behavior is covered by `tests/smoke/`.
 
 ## License
 

@@ -3,13 +3,6 @@
 //! Provides RFC 6455 handshake helpers, frame encoding/decoding, and a TCP
 //! client for `ws://` endpoints. The protocol core operates on byte arrays
 //! (`array[int]`, values 0-255).
-//!
-//! ## Transport limitations
-//!
-//! Network I/O uses the string-based `net` module. Frame bytes with values
-//! above 127 cannot be sent through `Connection.transmit_bytes`; text messages and
-//! control frames whose wire bytes stay within ASCII are supported by this
-//! path. Full binary-safe transport requires byte-capable socket primitives.
 
 use arrays
 use crypto
@@ -23,6 +16,8 @@ extern "C" fun ws_tcp_connect_ip(int a, int b, int c, int d, int port) -> int
 extern "C" fun ws_tcp_connect_localhost(int port) -> int
 extern "C" fun ws_send_byte(int fd, int value) -> int
 extern "C" fun ws_recv_byte(int fd) -> int
+extern "C" fun ws_poll_read(int fd, int timeout_ms) -> int
+extern "C" fun ws_set_recv_timeout(int fd, int timeout_ms) -> int
 extern "C" fun ws_close_fd(int fd) -> int
 
 // ── Byte helpers ───────────────────────────────────────────────────────────
@@ -737,6 +732,47 @@ class Connection {
             this.transmit_bytes(close_message(code, reason, mask))
         }
         this.close_socket()
+    }
+
+    /// Poll the socket for readability. timeout_ms: 0 = non-blocking, >0 = wait.
+    fun poll(int timeout_ms) -> bool {
+        if (!this.open || this.socket <= 0) { return false }
+        var ready = 0
+        unsafe { ready = ws_poll_read(this.socket, timeout_ms) }
+        return ready == 1
+    }
+
+    /// Set the socket receive timeout in milliseconds for blocking reads.
+    /// A value of 0 uses the OS default (no receive timeout).
+    fun set_recv_timeout(int timeout_ms) -> bool {
+        if (this.socket <= 0) { return false }
+        var rc = -1
+        unsafe { rc = ws_set_recv_timeout(this.socket, timeout_ms) }
+        return rc == 0
+    }
+
+    /// Read available bytes without blocking (polls with timeout 0 before reads).
+    fun pump_nonblocking(int max_bytes) -> bool {
+        if (!this.open || this.socket <= 0) { return false }
+        var limit = max_bytes
+        if (limit <= 0) { limit = 4096 }
+        if (!this.poll(0)) { return false }
+        var got_any = false
+        for (var i = 0; i < limit; i = i + 1) {
+            if (i > 0 && !this.poll(0)) { break }
+            var b = -2
+            unsafe { b = ws_recv_byte(this.socket) }
+            if (b >= 0) {
+                arrays.push(this.recv_buffer, b & 255)
+                got_any = true
+            } elif (b == -2) {
+                break
+            } else {
+                if (!got_any) { this.open = false }
+                break
+            }
+        }
+        return got_any
     }
 
     fun pump(int max_bytes) -> bool {

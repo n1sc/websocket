@@ -1,0 +1,63 @@
+use arrays
+use strings
+use "websocket.nt" as ws
+
+fun main() {
+    say("starting smoke test")
+    var conn = ws.connect("ws://127.0.0.1:8765/echo")
+    conn.set_recv_timeout(2000)
+    say("poll0=" + conn.poll(0))
+
+    var ok = conn.send_text("hello websocket")
+    if (!ok) {
+        say("send_text failed: " + conn.last_error)
+        conn.close_socket()
+        return
+    }
+
+    var out = ws.empty_frame()
+    var received = false
+    for (var i = 0; i < 200; i = i + 1) {
+        if (conn.pump_nonblocking(4096) || conn.poll(10)) {
+            conn.pump_nonblocking(4096)
+        } else {
+            conn.pump(1024)
+        }
+        if (conn.receive_frame(out)) {
+            received = true
+            i = 200
+        }
+    }
+
+    if (!received) {
+        say("no echo frame received")
+        conn.close_socket()
+        return
+    }
+
+    say("echo_opcode=" + out.opcode)
+    say("echo_text=" + out.payload_text())
+
+    var ping_ok = conn.send_ping("hi")
+    say("ping_sent=" + ping_ok)
+    var pong = ws.empty_frame()
+    var got_pong = false
+    for (var i = 0; i < 200; i = i + 1) {
+        conn.pump(1024)
+        if (conn.receive_frame(pong)) {
+            if (pong.is_pong()) {
+                got_pong = true
+                i = 200
+            }
+        }
+    }
+    say("pong=" + got_pong)
+    conn.send_close(1000, "bye")
+    say("closed")
+
+    if (received && out.is_text() && out.payload_text() == "hello websocket" && got_pong) {
+        say("SMOKE_OK")
+    } else {
+        say("SMOKE_FAIL")
+    }
+}

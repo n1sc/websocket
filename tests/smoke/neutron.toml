@@ -1,0 +1,9 @@
+[package]
+name = "ws_smoke"
+entry = "src/main.nt"
+output = "ws_smoke"
+compiler = "^0.1"
+
+[ffi]
+search_paths = ["native"]
+libraries = ["wsio", "c"]
