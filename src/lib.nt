@@ -1,27 +1,52 @@
 //! WebSocket protocol support for Neutron.
 //!
-//! Provides RFC 6455 handshake helpers, frame encoding/decoding, and a TCP
-//! client for `ws://` endpoints. The protocol core operates on byte arrays
-//! (`array[int]`, values 0-255).
+//! RFC 6455 handshake helpers, frame encoding/decoding, client and server
+//! connections. Protocol data is carried as byte arrays (`array[int]`, values
+//! 0-255) and text is validated as UTF-8.
 
 use arrays
 use crypto
-use memory
+use encoding
 use strings
 use testing
 
-extern "C" fun send(int fd, *const int buf, int len, int flags) -> int
+extern "C" fun ws_send_reset()
+extern "C" fun ws_send_put(int fd, int value) -> int
+extern "C" fun ws_send_flush(int fd) -> int
+extern "C" fun ws_tls_send_reset()
+extern "C" fun ws_tls_send_put(int tls, int value) -> int
+extern "C" fun ws_tls_send_flush(int tls) -> int
+extern "C" fun ws_recv_chunk(int fd, int max) -> int
+extern "C" fun ws_recv_chunk_byte(int index) -> int
+extern "C" fun ws_tls_recv_chunk(int tls, int max) -> int
+extern "C" fun ws_tls_recv_chunk_byte(int index) -> int
+extern "C" fun ws_recv_byte(int fd) -> int
 extern "C" fun ws_host_reset()
 extern "C" fun ws_host_append(int ch)
-extern "C" fun ws_host_connect(int port) -> int
-extern "C" fun ws_tcp_connect_ip(int a, int b, int c, int d, int port) -> int
-extern "C" fun ws_tcp_connect_localhost(int port) -> int
-extern "C" fun ws_recv_byte(int fd) -> int
+extern "C" fun ws_host_connect(int port, int timeout_ms) -> int
+extern "C" fun ws_tcp_connect_ip(int a, int b, int c, int d, int port, int timeout_ms) -> int
+extern "C" fun ws_tcp_connect_localhost(int port, int timeout_ms) -> int
 extern "C" fun ws_poll_read(int fd, int timeout_ms) -> int
 extern "C" fun ws_set_recv_timeout(int fd, int timeout_ms) -> int
 extern "C" fun ws_close_fd(int fd) -> int
+extern "C" fun ws_listen(int port, int backlog) -> int
+extern "C" fun ws_accept(int fd) -> int
+extern "C" fun ws_local_port(int fd) -> int
+extern "C" fun ws_ca_reset()
+extern "C" fun ws_ca_append(int ch)
+extern "C" fun ws_cert_reset()
+extern "C" fun ws_cert_append(int ch)
+extern "C" fun ws_key_reset()
+extern "C" fun ws_key_append(int ch)
+extern "C" fun ws_tls_connect(int fd, int verify) -> int
+extern "C" fun ws_tls_recv_byte(int tls) -> int
+extern "C" fun ws_tls_poll_read(int tls, int timeout_ms) -> int
+extern "C" fun ws_tls_set_recv_timeout(int tls, int timeout_ms) -> int
+extern "C" fun ws_tls_pending(int tls) -> int
+extern "C" fun ws_tls_close(int tls) -> int
 
-// ── Byte helpers ───────────────────────────────────────────────────────────
+fun default_max_message_size() -> int { return 67108864 }
+fun default_max_frame_size() -> int { return 16777216 }
 
 fun byte_hex_digit(int value) -> string {
     if (value < 10) { return strings.from_char_code(48 + value) }
@@ -83,62 +108,100 @@ fun bytes_slice(view array[int] data, int start, int end) -> array[int] {
     return out
 }
 
-fun codepoint_to_string(int cp) -> string {
-    if (cp <= 127) { return strings.from_char_code(cp) }
-    return "?"
+fun string_ends_with(view string text, view string suffix) -> bool {
+    var text_length = strings.length(text)
+    var suffix_length = strings.length(suffix)
+    if (suffix_length > text_length) { return false }
+    return strings.substring(text, text_length - suffix_length, -1) == suffix
 }
 
-fun bytes_to_string_lossy(view array[int] data) -> string {
-    var out = ""
+fun last_index_of_char(view string text, int ch) -> int {
+    var i = strings.length(text) - 1
+    while (i >= 0) {
+        if (strings.char_code(text, i) == ch) { return i }
+        i = i - 1
+    }
+    return -1
+}
+
+fun count_char(view string text, int ch) -> int {
+    var n = 0
+    var i = 0
+    var length = strings.length(text)
+    while (i < length) {
+        if (strings.char_code(text, i) == ch) { n = n + 1 }
+        i = i + 1
+    }
+    return n
+}
+
+fun utf8_sequence_length(int b0) -> int {
+    if (b0 < 128) { return 1 }
+    if (b0 >= 194 && b0 <= 223) { return 2 }
+    if (b0 >= 224 && b0 <= 239) { return 3 }
+    if (b0 >= 240 && b0 <= 244) { return 4 }
+    return 0
+}
+
+fun is_continuation_byte(int b) -> bool {
+    return (b & 192) == 128
+}
+
+fun utf8_valid_at(view array[int] data, int index, int count) -> bool {
+    var b0 = arrays.get(data, index) & 255
+    var length = utf8_sequence_length(b0)
+    if (length == 0 || index + length > count) { return false }
+    if (length == 1) { return true }
+
+    var b1 = arrays.get(data, index + 1) & 255
+    if (!is_continuation_byte(b1)) { return false }
+    if (length == 2) { return true }
+
+    if (b0 == 224 && b1 < 160) { return false }
+    if (b0 == 237 && b1 > 159) { return false }
+    var b2 = arrays.get(data, index + 2) & 255
+    if (!is_continuation_byte(b2)) { return false }
+    if (length == 3) { return true }
+
+    if (b0 == 240 && b1 < 144) { return false }
+    if (b0 == 244 && b1 > 143) { return false }
+    return is_continuation_byte(arrays.get(data, index + 3) & 255)
+}
+
+fun is_valid_utf8(view array[int] data) -> bool {
     var i = 0
     var count = arrays.length(data)
     while (i < count) {
-        var b0 = arrays.get(data, i) & 255
-        if (b0 < 128) {
-            out = out + strings.from_char_code(b0)
-            i = i + 1
-        } elif (b0 >= 194 && b0 <= 223 && i + 1 < count) {
-            var b1 = arrays.get(data, i + 1) & 255
-            if ((b1 & 192) == 128) {
-                var cp = ((b0 & 31) << 6) | (b1 & 63)
-                out = out + codepoint_to_string(cp)
-                i = i + 2
-            } else {
-                out = out + "?"
-                i = i + 1
-            }
-        } elif (b0 >= 224 && b0 <= 239 && i + 2 < count) {
-            var b1 = arrays.get(data, i + 1) & 255
-            var b2 = arrays.get(data, i + 2) & 255
-            if ((b1 & 192) == 128 && (b2 & 192) == 128) {
-                var cp = ((b0 & 15) << 12) | ((b1 & 63) << 6) | (b2 & 63)
-                out = out + codepoint_to_string(cp)
-                i = i + 3
-            } else {
-                out = out + "?"
-                i = i + 1
-            }
-        } elif (b0 >= 240 && b0 <= 244 && i + 3 < count) {
-            var b1 = arrays.get(data, i + 1) & 255
-            var b2 = arrays.get(data, i + 2) & 255
-            var b3 = arrays.get(data, i + 3) & 255
-            if ((b1 & 192) == 128 && (b2 & 192) == 128 && (b3 & 192) == 128) {
-                var cp = ((b0 & 7) << 18) | ((b1 & 63) << 12) | ((b2 & 63) << 6) | (b3 & 63)
-                out = out + codepoint_to_string(cp)
-                i = i + 4
-            } else {
-                out = out + "?"
-                i = i + 1
-            }
-        } else {
-            out = out + "?"
-            i = i + 1
-        }
+        if (!utf8_valid_at(data, i, count)) { return false }
+        i = i + utf8_sequence_length(arrays.get(data, i) & 255)
     }
-    return out
+    return true
 }
 
-// ── SHA-1 ──────────────────────────────────────────────────────────────────
+fun bytes_to_string_utf8(view array[int] data) -> string {
+    return encoding.hex_decode(bytes_to_hex(data))
+}
+
+fun bytes_to_string_lossy(view array[int] data) -> string {
+    var array[int] out = []
+    var i = 0
+    var count = arrays.length(data)
+    while (i < count) {
+        if (!utf8_valid_at(data, i, count)) {
+            arrays.push(out, 239)
+            arrays.push(out, 191)
+            arrays.push(out, 189)
+            i = i + 1
+        } else {
+            var length = utf8_sequence_length(arrays.get(data, i) & 255)
+            for (var j = 0; j < length; j = j + 1) {
+                arrays.push(out, arrays.get(data, i + j) & 255)
+            }
+            i = i + length
+        }
+    }
+    return encoding.hex_decode(bytes_to_hex(out))
+}
 
 fun sha1_left_rotate(int value, int amount) -> int {
     var v = value & 4294967295
@@ -266,8 +329,6 @@ fun sha1_hex(view string text) -> string {
     return bytes_to_hex(sha1_bytes(bytes))
 }
 
-// ── Base64 ─────────────────────────────────────────────────────────────────
-
 fun base64_alphabet_char(int index) -> string {
     if (index < 26) { return strings.from_char_code(65 + index) }
     if (index < 52) { return strings.from_char_code(97 + (index - 26)) }
@@ -351,8 +412,6 @@ fun base64_decode_bytes(view string text) -> array[int] {
     return out
 }
 
-// ── Handshake ──────────────────────────────────────────────────────────────
-
 fun make_key() -> string {
     var hex = crypto.random_bytes(16)
     var raw = hex_to_bytes(hex)
@@ -373,40 +432,140 @@ fun validate_accept(view string key, view string accept) -> bool {
     return accept_key(key) == strings.trim(accept)
 }
 
+fun header_value(view string response, view string name) -> string {
+    var lower_name = strings.lower(name)
+    var total = strings.length(response)
+    var line_end = strings.index_of(response, "\r\n", 0)
+    var step = 2
+    if (line_end < 0) {
+        line_end = strings.index_of(response, "\n", 0)
+        step = 1
+    }
+    if (line_end < 0) { return "" }
+
+    var pos = line_end + step
+    while (pos < total) {
+        var end = strings.index_of(response, "\r\n", pos)
+        var advance = 2
+        if (end < 0) {
+            end = strings.index_of(response, "\n", pos)
+            advance = 1
+        }
+        if (end < 0) {
+            end = total
+            advance = 0
+        }
+
+        var line = strings.substring(response, pos, end)
+        var colon = strings.index_of(line, ":", 0)
+        if (colon > 0) {
+            var header_name = strings.lower(strings.trim(strings.substring(line, 0, colon)))
+            if (header_name == lower_name) {
+                return strings.trim(strings.substring(line, colon + 1, -1))
+            }
+        }
+
+        if (advance == 0) { break }
+        pos = end + advance
+    }
+    return ""
+}
+
+fun status_code(view string response) -> int {
+    var end = strings.index_of(response, "\r\n", 0)
+    if (end < 0) { end = strings.index_of(response, "\n", 0) }
+    if (end < 0) { end = strings.length(response) }
+    var line = strings.substring(response, 0, end)
+    var first = strings.index_of(line, " ", 0)
+    if (first < 0) { return -1 }
+
+    var rest = strings.substring(line, first + 1, -1)
+    var second = strings.index_of(rest, " ", 0)
+    var code_text = ""
+    if (second >= 0) {
+        code_text = strings.substring(rest, 0, second)
+    } else {
+        code_text = rest
+    }
+    if (strings.length(code_text) != 3) { return -1 }
+
+    var code = 0
+    for (var i = 0; i < 3; i = i + 1) {
+        var c = strings.char_code(code_text, i)
+        if (c < 48 || c > 57) { return -1 }
+        code = code * 10 + (c - 48)
+    }
+    return code
+}
+
+fun header_has_token(view string value, view string token) -> bool {
+    var lower = strings.lower(value)
+    var start = 0
+    var total = strings.length(lower)
+    while (start <= total) {
+        var comma = strings.index_of(lower, ",", start)
+        var end = comma
+        if (end < 0) { end = total }
+        if (strings.trim(strings.substring(lower, start, end)) == token) { return true }
+        if (comma < 0) { break }
+        start = comma + 1
+    }
+    return false
+}
+
+fun is_upgrade_response(view string response) -> bool {
+    if (status_code(response) != 101) { return false }
+    var upgrade = header_value(response, "Upgrade")
+    var connection = header_value(response, "Connection")
+    return header_has_token(upgrade, "websocket") && header_has_token(connection, "upgrade")
+}
+
+fun is_upgrade_request(view string request) -> bool {
+    var end = strings.index_of(request, "\r\n", 0)
+    if (end < 0) { end = strings.index_of(request, "\n", 0) }
+    if (end < 0) { end = strings.length(request) }
+    if (!strings.starts_with(strings.substring(request, 0, end), "GET ")) { return false }
+
+    var upgrade = header_value(request, "Upgrade")
+    var connection = header_value(request, "Connection")
+    var key = header_value(request, "Sec-WebSocket-Key")
+    var version = header_value(request, "Sec-WebSocket-Version")
+    return header_has_token(upgrade, "websocket")
+        && header_has_token(connection, "upgrade")
+        && !strings.is_empty(key)
+        && version == "13"
+}
+
 fun build_upgrade_request(view string host, view string path, view string key) -> string {
+    return build_upgrade_request_ex(host, path, key, "", "", "")
+}
+
+fun build_upgrade_request_ex(view string host, view string path, view string key, view string origin, view string protocols, view string headers) -> string {
     var req = "GET " + copy(path) + " HTTP/1.1\r\n"
     req = req + "Host: " + copy(host) + "\r\n"
     req = req + "Upgrade: websocket\r\n"
     req = req + "Connection: Upgrade\r\n"
     req = req + "Sec-WebSocket-Key: " + copy(key) + "\r\n"
     req = req + "Sec-WebSocket-Version: 13\r\n"
+    if (!strings.is_empty(origin)) {
+        req = req + "Origin: " + copy(origin) + "\r\n"
+    }
+    if (!strings.is_empty(protocols)) {
+        req = req + "Sec-WebSocket-Protocol: " + copy(protocols) + "\r\n"
+    }
+    if (!strings.is_empty(headers)) {
+        req = req + copy(headers)
+        if (!string_ends_with(headers, "\r\n")) { req = req + "\r\n" }
+    }
     req = req + "\r\n"
     return req
 }
 
-fun header_value(view string response, view string name) -> string {
-    var needle = strings.lower(name) + ":"
-    var lower = strings.lower(response)
-    var pos = strings.index_of(lower, needle, 0)
-    if (pos < 0) { return "" }
-    var start = pos + strings.length(needle)
-    var end = strings.index_of(response, "\r\n", start)
-    if (end < 0) { end = strings.index_of(response, "\n", start) }
-    if (end < 0) { end = strings.length(response) }
-    return strings.trim(strings.substring(response, start, end))
+fun build_upgrade_response(view string request) -> string {
+    var key = header_value(request, "Sec-WebSocket-Key")
+    return "HTTP/1.1 101 Switching Protocols\r\nUpgrade: websocket\r\nConnection: Upgrade\r\nSec-WebSocket-Accept: "
+        + accept_key(key) + "\r\n\r\n"
 }
-
-fun is_upgrade_response(view string response) -> bool {
-    var lower = strings.lower(response)
-    if (strings.index_of(lower, " 101 ", 0) < 0 && strings.index_of(lower, " 101\r", 0) < 0) {
-        return false
-    }
-    var upgrade = strings.lower(header_value(response, "Upgrade"))
-    var connection = strings.lower(header_value(response, "Connection"))
-    return strings.contains(upgrade, "websocket") && strings.contains(connection, "upgrade")
-}
-
-// ── Opcodes ────────────────────────────────────────────────────────────────
 
 fun opcode_continuation() -> int { return 0 }
 fun opcode_text() -> int { return 1 }
@@ -414,8 +573,6 @@ fun opcode_binary() -> int { return 2 }
 fun opcode_close() -> int { return 8 }
 fun opcode_ping() -> int { return 9 }
 fun opcode_pong() -> int { return 10 }
-
-// ── Types ──────────────────────────────────────────────────────────────────
 
 class Frame {
     var bool fin
@@ -443,7 +600,8 @@ class Frame {
         }
     }
 
-    fun payload_text() -> string { return bytes_to_string_lossy(this.payload) }
+    fun payload_text() -> string { return bytes_to_string_utf8(this.payload) }
+    fun payload_text_lossy() -> string { return bytes_to_string_lossy(this.payload) }
     fun payload_hex() -> string { return bytes_to_hex(this.payload) }
     fun is_text() -> bool { return this.opcode == 1 }
     fun is_binary() -> bool { return this.opcode == 2 }
@@ -451,6 +609,14 @@ class Frame {
     fun is_ping() -> bool { return this.opcode == 9 }
     fun is_pong() -> bool { return this.opcode == 10 }
     fun is_control() -> bool { return this.opcode >= 8 }
+
+    fun clear() {
+        this.fin = true
+        this.opcode = 0
+        this.masked = false
+        this.masking_key = [0, 0, 0, 0]
+        this.payload = []
+    }
 }
 
 class DecodeResult {
@@ -472,18 +638,88 @@ class Url {
     var int port
     var string path
     var bool secure
+    var string user
+    var string password
 
-    fun init(view string host, int port, view string path, bool secure) {
+    fun init(view string host, int port, view string path, bool secure, view string user, view string password) {
         this.host = copy(host)
         this.port = port
         this.path = copy(path)
         this.secure = secure
+        this.user = copy(user)
+        this.password = copy(password)
+    }
+}
+
+class ConnectOptions {
+    var string origin
+    var string protocols
+    var string headers
+    var string proxy
+    var int connect_timeout_ms
+    var int recv_timeout_ms
+    var int max_message_size
+    var int max_frame_size
+    var int send_fragment_size
+    var int max_redirects
+    var bool verify_tls
+    var string ca_file
+    var string client_cert
+    var string client_key
+
+    fun init() {
+        this.origin = ""
+        this.protocols = ""
+        this.headers = ""
+        this.proxy = ""
+        this.connect_timeout_ms = 10000
+        this.recv_timeout_ms = 10000
+        this.max_message_size = 67108864
+        this.max_frame_size = 16777216
+        this.send_fragment_size = 65536
+        this.max_redirects = 5
+        this.verify_tls = true
+        this.ca_file = ""
+        this.client_cert = ""
+        this.client_key = ""
+    }
+}
+
+class HandshakeResult {
+    var bool ok
+    var int socket
+    var int tls_handle
+    var string key
+    var string protocol
+    var string redirect
+    var string error
+    var int status
+
+    fun init() {
+        this.ok = false
+        this.socket = -1
+        this.tls_handle = -1
+        this.key = ""
+        this.protocol = ""
+        this.redirect = ""
+        this.error = ""
+        this.status = 0
     }
 }
 
 fun empty_frame() -> Frame {
     var array[int] empty = []
     return Frame(true, 0, false, [0, 0, 0, 0], empty)
+}
+
+fun empty_decode() -> DecodeResult {
+    var ef = empty_frame()
+    return DecodeResult(false, 0, ef, "incomplete")
+}
+
+fun decode_fail(view string reason) -> DecodeResult {
+    var ef = empty_frame()
+    return DecodeResult(false, 0, ef, reason)
 }
 
 fun apply_mask(view array[int] payload, view array[int] masking_key) -> array[int] {
@@ -503,7 +739,7 @@ fun random_mask() -> array[int] {
     var array[int] mask = []
     for (var i = 0; i < 4; i = i + 1) {
         if (i < arrays.length(raw)) {
-            arrays.push(mask, arrays.get(raw, i) & 127)
+            arrays.push(mask, arrays.get(raw, i) & 255)
         } else {
             arrays.push(mask, 0)
         }
@@ -511,9 +747,16 @@ fun random_mask() -> array[int] {
     return mask
 }
 
-// ── Frame encoding/decoding ────────────────────────────────────────────────
+fun valid_opcode(int opcode) -> bool {
+    return opcode == 0 || opcode == 1 || opcode == 2 || opcode == 8 || opcode == 9 || opcode == 10
+}
 
 fun encode(view Frame value) -> array[int] {
+    if (!valid_opcode(value.opcode)) { throw "websocket: invalid opcode" }
+    if (value.opcode >= 8 && (!value.fin || arrays.length(value.payload) > 125)) {
+        throw "websocket: invalid control frame"
+    }
+
     var array[int] out = []
     var b0 = value.opcode & 15
     if (value.fin) { b0 = b0 | 128 }
@@ -562,11 +805,12 @@ fun encode(view Frame value) -> array[int] {
 }
 
 fun decode(view array[int] data, int offset) -> DecodeResult {
+    return decode_limited(data, offset, default_max_frame_size())
+}
+
+fun decode_limited(view array[int] data, int offset, int max_payload) -> DecodeResult {
     var total = arrays.length(data)
-    if (total - offset < 2) {
-        var ef = empty_frame()
-        return DecodeResult(false, 0, ef, "incomplete")
-    }
+    if (offset < 0 || total - offset < 2) { return decode_fail("incomplete") }
 
     var b0 = arrays.get(data, offset) & 255
     var b1 = arrays.get(data, offset + 1) & 255
@@ -576,31 +820,43 @@ fun decode(view array[int] data, int offset) -> DecodeResult {
     var length = b1 & 127
     var pos = offset + 2
 
+    if ((b0 & 112) != 0) { return decode_fail("reserved bits set") }
+    if (!valid_opcode(opcode)) { return decode_fail("reserved opcode") }
+    if (opcode >= 8) {
+        if (!fin) { return decode_fail("fragmented control frame") }
+        if (length > 125) { return decode_fail("control frame too long") }
+    }
+
     if (length == 126) {
-        if (total - pos < 2) {
-            var ef = empty_frame()
-            return DecodeResult(false, 0, ef, "incomplete")
-        }
-        length = ((arrays.get(data, pos) & 255) << 8) | (arrays.get(data, pos + 1) & 255)
+        if (total - pos < 2) { return decode_fail("incomplete") }
+        var ext = ((arrays.get(data, pos) & 255) << 8) | (arrays.get(data, pos + 1) & 255)
+        if (ext < 126) { return decode_fail("non-minimal length") }
+        length = ext
         pos = pos + 2
     } elif (length == 127) {
-        if (total - pos < 8) {
-            var ef = empty_frame()
-            return DecodeResult(false, 0, ef, "incomplete")
+        if (total - pos < 8) { return decode_fail("incomplete") }
+        if ((arrays.get(data, pos) & 128) != 0) { return decode_fail("invalid 64-bit length") }
+
+        var high = 0
+        for (var i = 0; i < 4; i = i + 1) {
+            high = (high << 8) | (arrays.get(data, pos + i) & 255)
         }
-        length = 0
+        if (high != 0) { return decode_fail("payload too large") }
+
+        var low = 0
         for (var i = 4; i < 8; i = i + 1) {
-            length = (length << 8) | (arrays.get(data, pos + i) & 255)
+            low = (low << 8) | (arrays.get(data, pos + i) & 255)
         }
+        if (low < 65536) { return decode_fail("non-minimal length") }
+        length = low
         pos = pos + 8
     }
 
+    if (length > max_payload) { return decode_fail("payload too large") }
+
     var masking_key = [0, 0, 0, 0]
     if (masked) {
-        if (total - pos < 4) {
-            var ef = empty_frame()
-            return DecodeResult(false, 0, ef, "incomplete")
-        }
+        if (total - pos < 4) { return decode_fail("incomplete") }
         masking_key = [
             arrays.get(data, pos) & 255,
             arrays.get(data, pos + 1) & 255,
@@ -610,10 +866,7 @@ fun decode(view array[int] data, int offset) -> DecodeResult {
         pos = pos + 4
     }
 
-    if (total - pos < length) {
-        var ef = empty_frame()
-        return DecodeResult(false, 0, ef, "incomplete")
-    }
+    if (total - pos < length) { return decode_fail("incomplete") }
 
     var payload = bytes_slice(data, pos, pos + length)
     if (masked) { payload = apply_mask(payload, masking_key) }
@@ -623,19 +876,53 @@ fun decode(view array[int] data, int offset) -> DecodeResult {
     return DecodeResult(true, pos - offset, f, "")
 }
 
+fun decode_client(view array[int] data, int offset) -> DecodeResult {
+    return decode_client_limited(data, offset, default_max_frame_size())
+}
+
+fun decode_client_limited(view array[int] data, int offset, int max_payload) -> DecodeResult {
+    var decoded = decode_limited(data, offset, max_payload)
+    if (decoded.ok && decoded.frame.masked) {
+        return decode_fail("server frame must not be masked")
+    }
+    return decoded
+}
+
+fun decode_server(view array[int] data, int offset) -> DecodeResult {
+    return decode_server_limited(data, offset, default_max_frame_size())
+}
+
+fun decode_server_limited(view array[int] data, int offset, int max_payload) -> DecodeResult {
+    var decoded = decode_limited(data, offset, max_payload)
+    if (decoded.ok && !decoded.frame.masked) {
+        return decode_fail("client frame must be masked")
+    }
+    return decoded
+}
+
 fun text_message(view string text, view array[int] masking_key) -> array[int] {
+    return text_message_side(text, masking_key, true)
+}
+
+fun text_message_side(view string text, view array[int] masking_key, bool masked) -> array[int] {
     var payload = string_to_bytes(text)
-    var f = Frame(true, 1, true, masking_key, payload)
-    return encode(f)
+    return encode(Frame(true, 1, masked, masking_key, payload))
 }
 
 fun binary_message_hex(view string hex, view array[int] masking_key) -> array[int] {
+    return binary_message_side(hex, masking_key, true)
+}
+
+fun binary_message_side(view string hex, view array[int] masking_key, bool masked) -> array[int] {
     var payload = hex_to_bytes(hex)
-    var f = Frame(true, 2, true, masking_key, payload)
-    return encode(f)
+    return encode(Frame(true, 2, masked, masking_key, payload))
 }
 
 fun close_message(int code, view string reason, view array[int] masking_key) -> array[int] {
+    return close_message_side(code, reason, masking_key, true)
+}
+
+fun close_message_side(int code, view string reason, view array[int] masking_key, bool masked) -> array[int] {
     var array[int] payload = []
     arrays.push(payload, (code >> 8) & 255)
     arrays.push(payload, code & 255)
@@ -644,139 +931,360 @@ fun close_message(int code, view string reason, view array[int] masking_key) -> 
     for (var i = 0; i < count; i = i + 1) {
         arrays.push(payload, arrays.get(reason_bytes, i) & 255)
     }
-    var f = Frame(true, 8, true, masking_key, payload)
-    return encode(f)
+    return encode(Frame(true, 8, masked, masking_key, payload))
 }
 
 fun ping_message(view array[int] payload, view array[int] masking_key) -> array[int] {
-    var f = Frame(true, 9, true, masking_key, payload)
-    return encode(f)
+    return ping_message_side(payload, masking_key, true)
+}
+
+fun ping_message_side(view array[int] payload, view array[int] masking_key, bool masked) -> array[int] {
+    return encode(Frame(true, 9, masked, masking_key, payload))
 }
 
 fun pong_message(view array[int] payload, view array[int] masking_key) -> array[int] {
-    var f = Frame(true, 10, true, masking_key, payload)
-    return encode(f)
+    return pong_message_side(payload, masking_key, true)
 }
 
-// ── Client / URL ───────────────────────────────────────────────────────────
+fun pong_message_side(view array[int] payload, view array[int] masking_key, bool masked) -> array[int] {
+    return encode(Frame(true, 10, masked, masking_key, payload))
+}
+
+fun copy_frame(view mut Frame out, view Frame src) {
+    out.fin = src.fin
+    out.opcode = src.opcode
+    out.masked = src.masked
+    out.masking_key = copy(src.masking_key)
+    out.payload = copy(src.payload)
+}
+
+fun close_payload_code(view array[int] payload) -> int {
+    if (arrays.length(payload) < 2) { return 1005 }
+    return ((arrays.get(payload, 0) & 255) << 8) | (arrays.get(payload, 1) & 255)
+}
+
+fun close_payload_reason(view array[int] payload) -> string {
+    if (arrays.length(payload) <= 2) { return "" }
+    return bytes_to_string_lossy(bytes_slice(payload, 2, arrays.length(payload)))
+}
+
+fun frame_total_length(view array[int] data, int offset, int max_payload) -> int {
+    var total = arrays.length(data)
+    if (offset < 0 || total - offset < 2) { return -2 }
+
+    var b1 = arrays.get(data, offset + 1) & 255
+    var length = b1 & 127
+    var pos = offset + 2
+
+    if (length == 126) {
+        if (total - pos < 2) { return -2 }
+        length = ((arrays.get(data, pos) & 255) << 8) | (arrays.get(data, pos + 1) & 255)
+        pos = pos + 2
+    } elif (length == 127) {
+        if (total - pos < 8) { return -2 }
+        var high = 0
+        for (var i = 0; i < 4; i = i + 1) {
+            high = (high << 8) | (arrays.get(data, pos + i) & 255)
+        }
+        if (high != 0) { return -1 }
+        var low = 0
+        for (var i = 4; i < 8; i = i + 1) {
+            low = (low << 8) | (arrays.get(data, pos + i) & 255)
+        }
+        length = low
+        pos = pos + 8
+    }
+
+    if ((b1 & 128) != 0) {
+        if (total - pos < 4) { return -2 }
+        pos = pos + 4
+    }
+
+    if (length > max_payload) { return -1 }
+    if (total - pos < length) { return -2 }
+    return pos + length - offset
+}
+
+fun decode_for_connection(view array[int] data, bool server_side, int max_frame) -> DecodeResult {
+    if (server_side) { return decode_server_limited(data, 0, max_frame) }
+    return decode_client_limited(data, 0, max_frame)
+}
 
 class Connection {
     var int socket
     var bool open
+    var bool tls
+    var int tls_handle
+    var bool server_side
     var string key
     var array[int] recv_buffer
     var string protocol
     var string last_error
+    var int max_message_size
+    var int max_frame_size
+    var int send_fragment_size
+    var bool close_sent
+    var bool close_received
+    var int close_code
+    var string close_reason
+    var bool fragmenting
+    var int fragment_opcode
+    var array[int] fragment_buffer
 
     fun init(int socket, view string key) {
         this.socket = socket
         this.open = true
+        this.tls = false
+        this.tls_handle = -1
+        this.server_side = false
         this.key = copy(key)
         this.recv_buffer = []
         this.protocol = ""
         this.last_error = ""
+        this.max_message_size = 67108864
+        this.max_frame_size = 16777216
+        this.send_fragment_size = 65536
+        this.close_sent = false
+        this.close_received = false
+        this.close_code = 0
+        this.close_reason = ""
+        this.fragmenting = false
+        this.fragment_opcode = 0
+        this.fragment_buffer = []
+    }
+
+    fun init_tls(int socket, int tls_handle, view string key) {
+        this.socket = socket
+        this.open = true
+        this.tls = true
+        this.tls_handle = tls_handle
+        this.server_side = false
+        this.key = copy(key)
+        this.recv_buffer = []
+        this.protocol = ""
+        this.last_error = ""
+        this.max_message_size = 67108864
+        this.max_frame_size = 16777216
+        this.send_fragment_size = 65536
+        this.close_sent = false
+        this.close_received = false
+        this.close_code = 0
+        this.close_reason = ""
+        this.fragmenting = false
+        this.fragment_opcode = 0
+        this.fragment_buffer = []
+    }
+
+    fun configure(view ConnectOptions options) {
+        if (options.max_message_size > 0) { this.max_message_size = options.max_message_size }
+        if (options.max_frame_size > 0) { this.max_frame_size = options.max_frame_size }
+        if (options.send_fragment_size > 0) { this.send_fragment_size = options.send_fragment_size }
+        if (options.recv_timeout_ms > 0) {
+            if (this.tls && this.tls_handle >= 0) {
+                unsafe { ws_tls_set_recv_timeout(this.tls_handle, options.recv_timeout_ms) }
+            } elif (this.socket > 0) {
+                unsafe { ws_set_recv_timeout(this.socket, options.recv_timeout_ms) }
+            }
+        }
     }
 
     fun close_socket() {
-        if (this.socket > 0) {
-            unsafe {
-                ws_close_fd(this.socket)
-            }
+        if (this.tls && this.tls_handle >= 0) {
+            unsafe { ws_tls_close(this.tls_handle) }
+            this.tls_handle = -1
+            this.socket = 0
+        } elif (this.socket > 0) {
+            unsafe { ws_close_fd(this.socket) }
             this.socket = 0
         }
         this.open = false
+        this.recv_buffer = []
+        this.key = ""
+        this.protocol = ""
+        this.fragmenting = false
+        this.fragment_opcode = 0
+        this.fragment_buffer = []
     }
 
-    /// Send raw frame bytes over the socket (byte-safe) via direct libc FFI.
+    fun next_mask() -> array[int] {
+        if (this.server_side) { return [0, 0, 0, 0] }
+        return random_mask()
+    }
+
+    /// Send raw frame bytes over the socket (byte-safe, buffered).
+
     fun transmit_bytes(view array[int] data) -> bool {
-        if (!this.open || this.socket <= 0) { return false }
+        if (!this.open) { return false }
+        if (!this.tls && this.socket <= 0) { return false }
+        if (this.tls && this.tls_handle < 0) { return false }
+
+        if (this.tls) {
+            unsafe { ws_tls_send_reset() }
+        } else {
+            unsafe { ws_send_reset() }
+        }
+
         var count = arrays.length(data)
         for (var i = 0; i < count; i = i + 1) {
-            var int b = arrays.get(data, i) & 255
-            var sent = -1
-            unsafe {
-                var *const int p = memory.raw_address(&b)
-                sent = send(this.socket, p, 1, 0)
+            var bval = arrays.get(data, i) & 255
+            var rc = -1
+            if (this.tls) {
+                unsafe { rc = ws_tls_send_put(this.tls_handle, bval) }
+            } else {
+                unsafe { rc = ws_send_put(this.socket, bval) }
             }
-            if (sent != 1) {
-                // retry once (e.g. EINTR); errno not inspected here
-                if (sent < 0) {
-                    unsafe {
-                        var *const int p = memory.raw_address(&b)
-                        sent = send(this.socket, p, 1, 0)
-                    }
-                }
-                if (sent != 1) {
-                    this.last_error = "send failed"
-                    return false
-                }
+            if (rc != 0) {
+                this.last_error = "send failed"
+                return false
             }
+        }
+
+        var flushed = -1
+        if (this.tls) {
+            unsafe { flushed = ws_tls_send_flush(this.tls_handle) }
+        } else {
+            unsafe { flushed = ws_send_flush(this.socket) }
+        }
+        if (flushed != 0) {
+            this.last_error = "send failed"
+            return false
+        }
+        return true
+    }
+
+    fun send_data(int opcode, view array[int] payload) -> bool {
+        if (!this.open) { return false }
+        var count = arrays.length(payload)
+        var limit = this.send_fragment_size
+        if (limit <= 0) { limit = 65536 }
+
+        if (count <= limit) {
+            var mask = this.next_mask()
+            return this.transmit_bytes(encode(Frame(true, opcode, !this.server_side, mask, payload)))
+        }
+
+        var offset = 0
+        var first = true
+        while (offset < count) {
+            var end = offset + limit
+            if (end > count) { end = count }
+            var chunk = bytes_slice(payload, offset, end)
+            var op = opcode
+            if (!first) { op = 0 }
+            var mask = this.next_mask()
+            if (!this.transmit_bytes(encode(Frame(end == count, op, !this.server_side, mask, chunk)))) {
+                return false
+            }
+            first = false
+            offset = end
         }
         return true
     }
 
     fun send_text(view string text) -> bool {
-        var mask = random_mask()
-        return this.transmit_bytes(text_message(text, mask))
+        return this.send_data(1, string_to_bytes(text))
     }
 
     fun send_binary_hex(view string hex) -> bool {
-        var mask = random_mask()
-        return this.transmit_bytes(binary_message_hex(hex, mask))
+        return this.send_data(2, hex_to_bytes(hex))
     }
 
     fun send_ping(view string text) -> bool {
-        var mask = random_mask()
         var payload = string_to_bytes(text)
-        return this.transmit_bytes(ping_message(payload, mask))
+        if (arrays.length(payload) > 125) {
+            this.last_error = "ping payload too long"
+            return false
+        }
+        var mask = this.next_mask()
+        var wire = ping_message_side(payload, mask, !this.server_side)
+        return this.transmit_bytes(wire)
     }
 
     fun send_pong(view string text) -> bool {
-        var mask = random_mask()
         var payload = string_to_bytes(text)
-        return this.transmit_bytes(pong_message(payload, mask))
-    }
-
-    fun send_close(int code, view string reason) {
-        if (this.open) {
-            var mask = random_mask()
-            this.transmit_bytes(close_message(code, reason, mask))
+        if (arrays.length(payload) > 125) {
+            this.last_error = "pong payload too long"
+            return false
         }
-        this.close_socket()
+        var mask = this.next_mask()
+        return this.transmit_bytes(pong_message_side(payload, mask, !this.server_side))
     }
 
-    /// Poll the socket for readability. timeout_ms: 0 = non-blocking, >0 = wait.
+    fun send_pong_bytes(view array[int] payload) -> bool {
+        var mask = this.next_mask()
+        return this.transmit_bytes(pong_message_side(payload, mask, !this.server_side))
+    }
+
     fun poll(int timeout_ms) -> bool {
-        if (!this.open || this.socket <= 0) { return false }
+        if (!this.open) { return false }
         var ready = 0
-        unsafe { ready = ws_poll_read(this.socket, timeout_ms) }
+        if (this.tls) {
+            if (this.tls_handle < 0) { return false }
+            unsafe { ready = ws_tls_poll_read(this.tls_handle, timeout_ms) }
+        } else {
+            if (this.socket <= 0) { return false }
+            unsafe { ready = ws_poll_read(this.socket, timeout_ms) }
+        }
         return ready == 1
     }
 
     /// Set the socket receive timeout in milliseconds for blocking reads.
     /// A value of 0 uses the OS default (no receive timeout).
+
     fun set_recv_timeout(int timeout_ms) -> bool {
-        if (this.socket <= 0) { return false }
         var rc = -1
-        unsafe { rc = ws_set_recv_timeout(this.socket, timeout_ms) }
+        if (this.tls) {
+            if (this.tls_handle < 0) { return false }
+            unsafe { rc = ws_tls_set_recv_timeout(this.tls_handle, timeout_ms) }
+        } else {
+            if (this.socket <= 0) { return false }
+            unsafe { rc = ws_set_recv_timeout(this.socket, timeout_ms) }
+        }
         return rc == 0
     }
 
+    fun recv_into_buffer(int max_bytes) -> int {
+        var want = max_bytes
+        if (want <= 0 || want > 65536) { want = 65536 }
+        var got = -2
+        if (this.tls) {
+            unsafe { got = ws_tls_recv_chunk(this.tls_handle, want) }
+        } else {
+            unsafe { got = ws_recv_chunk(this.socket, want) }
+        }
+        if (got > 0) {
+            for (var i = 0; i < got; i = i + 1) {
+                var b = -1
+                if (this.tls) {
+                    unsafe { b = ws_tls_recv_chunk_byte(i) }
+                } else {
+                    unsafe { b = ws_recv_chunk_byte(i) }
+                }
+                if (b >= 0) { arrays.push(this.recv_buffer, b & 255) }
+            }
+        }
+        return got
+    }
+
     /// Read available bytes without blocking (polls with timeout 0 before reads).
+
     fun pump_nonblocking(int max_bytes) -> bool {
-        if (!this.open || this.socket <= 0) { return false }
+        if (!this.open) { return false }
+        if (!this.tls && this.socket <= 0) { return false }
+        if (this.tls && this.tls_handle < 0) { return false }
         var limit = max_bytes
         if (limit <= 0) { limit = 4096 }
         if (!this.poll(0)) { return false }
+
         var got_any = false
-        for (var i = 0; i < limit; i = i + 1) {
-            if (i > 0 && !this.poll(0)) { break }
-            var b = -2
-            unsafe { b = ws_recv_byte(this.socket) }
-            if (b >= 0) {
-                arrays.push(this.recv_buffer, b & 255)
+        var remaining = limit
+        while (remaining > 0) {
+            if (got_any && !this.poll(0)) { break }
+            var got = this.recv_into_buffer(remaining)
+            if (got > 0) {
                 got_any = true
-            } elif (b == -2) {
+                remaining = remaining - got
+            } elif (got == -2) {
                 break
             } else {
                 if (!got_any) { this.open = false }
@@ -787,24 +1295,23 @@ class Connection {
     }
 
     fun pump(int max_bytes) -> bool {
-        if (!this.open || this.socket <= 0) { return false }
+        if (!this.open) { return false }
+        if (!this.tls && this.socket <= 0) { return false }
+        if (this.tls && this.tls_handle < 0) { return false }
         var limit = max_bytes
         if (limit <= 0) { limit = 4096 }
+
         var got_any = false
-        for (var i = 0; i < limit; i = i + 1) {
-            var b = -2
-            unsafe {
-                b = ws_recv_byte(this.socket)
-            }
-            if (b >= 0) {
-                arrays.push(this.recv_buffer, b & 255)
+        var remaining = limit
+        while (remaining > 0) {
+            var got = this.recv_into_buffer(remaining)
+            if (got > 0) {
                 got_any = true
-            } elif (b == -2) {
-                // timeout/would-block
+                remaining = remaining - got
+            } elif (got == -2) {
                 if (got_any) { return true }
                 return false
             } else {
-                // EOF or error
                 if (got_any) { return true }
                 this.open = false
                 return false
@@ -813,24 +1320,194 @@ class Connection {
         return got_any
     }
 
-    /// Decode the next buffered frame into `out_frame`. Returns true on success.
-    fun receive_frame(view mut Frame out_frame) -> bool {
-        var decoded = decode(this.recv_buffer, 0)
-        if (decoded.ok) {
-            out_frame.fin = decoded.frame.fin
-            out_frame.opcode = decoded.frame.opcode
-            out_frame.masked = decoded.frame.masked
-            out_frame.masking_key = decoded.frame.masking_key
-            out_frame.payload = decoded.frame.payload
-            var array[int] remaining = []
-            var total = arrays.length(this.recv_buffer)
-            for (var i = decoded.consumed; i < total; i = i + 1) {
-                arrays.push(remaining, arrays.get(this.recv_buffer, i) & 255)
-            }
-            this.recv_buffer = remaining
-            return true
+    fun try_take_frame(view mut Frame out_frame) -> int {
+        var needed = frame_total_length(this.recv_buffer, 0, this.max_frame_size)
+        if (needed == -2) { return 0 }
+
+        var dr = decode_for_connection(this.recv_buffer, this.server_side, this.max_frame_size)
+        if (!dr.ok) {
+            this.last_error = copy(dr.error)
+            return -1
         }
-        return false
+
+        copy_frame(out_frame, dr.frame)
+        var array[int] remaining = []
+        var total = arrays.length(this.recv_buffer)
+        for (var i = dr.consumed; i < total; i = i + 1) {
+            arrays.push(remaining, arrays.get(this.recv_buffer, i) & 255)
+        }
+        this.recv_buffer = remaining
+        return 1
+    }
+
+    fun send_close_frame(int code, view string reason) -> bool {
+        if (!this.open || this.close_sent) { return false }
+        var mask = this.next_mask()
+        this.close_sent = true
+        return this.transmit_bytes(close_message_side(code, reason, mask, !this.server_side))
+    }
+
+    fun protocol_fail(int code, view string reason) {
+        this.last_error = copy(reason)
+        if (this.open && !this.close_sent) {
+            this.send_close_frame(code, reason)
+        }
+        this.open = false
+    }
+
+    fun validate_message(view Frame message) -> bool {
+        if (message.is_text() && !is_valid_utf8(message.payload)) {
+            this.protocol_fail(1007, "invalid UTF-8 in text message")
+            return false
+        }
+        return true
+    }
+
+    fun wait_for_close(int timeout_ms) -> bool {
+        return wait_for_close_impl(this, timeout_ms)
+    }
+
+    fun send_close(int code, view string reason) {
+        if (this.open && !this.close_sent) {
+            this.send_close_frame(code, reason)
+        }
+        this.wait_for_close(2000)
+        this.close_socket()
+    }
+
+    fun receive_frame(view mut Frame out_frame) -> bool {
+        return this.try_take_frame(out_frame) == 1
+    }
+
+    fun receive_message_inner(view mut Frame out_frame, bool block) -> bool {
+        return receive_message_impl(this, out_frame, block)
+    }
+
+    fun receive_message(view mut Frame out_frame) -> bool {
+        return this.receive_message_inner(out_frame, true)
+    }
+
+    fun receive_message_nonblocking(view mut Frame out_frame) -> bool {
+        return this.receive_message_inner(out_frame, false)
+    }
+}
+
+fun wait_for_close_impl(view mut Connection conn, int timeout_ms) -> bool {
+    var waited = 0
+    var frame = empty_frame()
+    while (!conn.close_received && conn.open && waited < timeout_ms) {
+        var step = 50
+        if (step > timeout_ms - waited) { step = timeout_ms - waited }
+        if (!conn.poll(step)) {
+            waited = waited + step
+            continue
+        }
+        if (!conn.pump(65536)) { break }
+
+        while (true) {
+            frame.clear()
+            var status = conn.try_take_frame(frame)
+            if (status != 1) { break }
+            if (frame.is_close()) {
+                conn.close_received = true
+                conn.close_code = close_payload_code(frame.payload)
+                conn.close_reason = close_payload_reason(frame.payload)
+                break
+            }
+            if (frame.is_ping()) {
+                conn.send_pong_bytes(frame.payload)
+            }
+        }
+    }
+    return conn.close_received
+}
+
+fun receive_message_impl(view mut Connection conn, view mut Frame out_frame, bool block) -> bool {
+    var frame = empty_frame()
+    while (true) {
+        frame.clear()
+        var status = conn.try_take_frame(frame)
+        if (status == 1) {
+            if (frame.is_control()) {
+                if (frame.is_ping()) {
+                    conn.send_pong_bytes(frame.payload)
+                    continue
+                }
+                if (frame.is_close()) {
+                    conn.close_received = true
+                    conn.close_code = close_payload_code(frame.payload)
+                    conn.close_reason = close_payload_reason(frame.payload)
+                    if (!conn.close_sent) { conn.send_close_frame(1000, "") }
+                    conn.open = false
+                    copy_frame(out_frame, frame)
+                    return true
+                }
+                copy_frame(out_frame, frame)
+                return true
+            }
+
+            if (frame.opcode == 0) {
+                if (!conn.fragmenting) {
+                    conn.protocol_fail(1002, "unexpected continuation frame")
+                    return false
+                }
+                var part_count = arrays.length(frame.payload)
+                for (var i = 0; i < part_count; i = i + 1) {
+                    arrays.push(conn.fragment_buffer, arrays.get(frame.payload, i) & 255)
+                }
+                if (arrays.length(conn.fragment_buffer) > conn.max_message_size) {
+                    conn.protocol_fail(1009, "message too large")
+                    return false
+                }
+                if (frame.fin) {
+                    var message = Frame(true, conn.fragment_opcode, false, [0, 0, 0, 0], conn.fragment_buffer)
+                    conn.fragmenting = false
+                    conn.fragment_opcode = 0
+                    conn.fragment_buffer = []
+                    if (!conn.validate_message(message)) { return false }
+                    copy_frame(out_frame, message)
+                    return true
+                }
+                continue
+            }
+
+            if (conn.fragmenting) {
+                conn.protocol_fail(1002, "new data frame during fragmentation")
+                return false
+            }
+            if (frame.fin) {
+                if (!conn.validate_message(frame)) { return false }
+                copy_frame(out_frame, frame)
+                return true
+            }
+
+            conn.fragmenting = true
+            conn.fragment_opcode = frame.opcode
+            conn.fragment_buffer = []
+            var count = arrays.length(frame.payload)
+            for (var i = 0; i < count; i = i + 1) {
+                arrays.push(conn.fragment_buffer, arrays.get(frame.payload, i) & 255)
+            }
+            if (arrays.length(conn.fragment_buffer) > conn.max_message_size) {
+                conn.protocol_fail(1009, "message too large")
+                return false
+            }
+            continue
+        }
+
+        if (status < 0) {
+            conn.protocol_fail(1002, conn.last_error)
+            return false
+        }
+
+        if (block) {
+            if (!conn.pump(65536)) {
+                conn.last_error = "receive timeout"
+                return false
+            }
+        } else {
+            if (!conn.pump_nonblocking(65536)) { return false }
+        }
     }
 }
 
@@ -841,6 +1518,20 @@ fun parse_int(view string text) -> int {
         var code = strings.char_code(text, i)
         if (code >= 48 && code <= 57) { value = value * 10 + (code - 48) }
     }
+    return value
+}
+
+fun parse_port(view string text) -> int {
+    if (strings.is_empty(text)) { throw "websocket: empty port" }
+    var value = 0
+    var length = strings.length(text)
+    for (var i = 0; i < length; i = i + 1) {
+        var code = strings.char_code(text, i)
+        if (code < 48 || code > 57) { throw "websocket: invalid port" }
+        value = value * 10 + (code - 48)
+        if (value > 65535) { throw "websocket: invalid port" }
+    }
+    if (value == 0) { throw "websocket: invalid port" }
     return value
 }
 
@@ -866,36 +1557,128 @@ fun parse_url(view string url) -> Url {
         secure = true
         rest = strings.substring(rest, 6, -1)
     } elif (strings.starts_with(rest, "ws://")) {
-        secure = false
         rest = strings.substring(rest, 5, -1)
-    } elif (strings.starts_with(rest, "http://")) {
-        secure = false
-        rest = strings.substring(rest, 7, -1)
     } elif (strings.starts_with(rest, "https://")) {
         secure = true
         rest = strings.substring(rest, 8, -1)
+    } elif (strings.starts_with(rest, "http://")) {
+        rest = strings.substring(rest, 7, -1)
+    } else {
+        throw "websocket: unsupported URL scheme"
     }
 
-    var path = "/"
+    var hash = strings.index_of(copy(rest), "#", 0)
+    if (hash >= 0) { rest = strings.substring(rest, 0, hash) }
+
     var slash = strings.index_of(copy(rest), "/", 0)
-    var hostport = copy(rest)
-    if (slash >= 0) {
-        hostport = strings.substring(copy(rest), 0, slash)
-        path = strings.substring(rest, slash, -1)
-        if (strings.is_empty(path)) { path = "/" }
+    var qmark = strings.index_of(copy(rest), "?", 0)
+    var path_start = slash
+    if (path_start < 0 || (qmark >= 0 && qmark < path_start)) { path_start = qmark }
+
+    var authority = copy(rest)
+    var path = "/"
+    if (path_start >= 0) {
+        authority = strings.substring(copy(rest), 0, path_start)
+        path = strings.substring(rest, path_start, -1)
+        if (strings.is_empty(path) || strings.starts_with(path, "?")) { path = "/" + path }
     }
 
-    var host = copy(hostport)
+    var user = ""
+    var password = ""
+    var at = last_index_of_char(authority, 64)
+    if (at >= 0) {
+        var userinfo = strings.substring(copy(authority), 0, at)
+        authority = strings.substring(authority, at + 1, -1)
+        var user_colon = strings.index_of(userinfo, ":", 0)
+        if (user_colon >= 0) {
+            user = strings.substring(copy(userinfo), 0, user_colon)
+            password = strings.substring(userinfo, user_colon + 1, -1)
+        } else {
+            user = userinfo
+        }
+    }
+
+    var host = copy(authority)
     var port = 80
     if (secure) { port = 443 }
-    var colon = strings.index_of(copy(hostport), ":", 0)
-    if (colon >= 0) {
-        host = strings.substring(copy(hostport), 0, colon)
-        var port_text = strings.substring(hostport, colon + 1, -1)
-        if (!strings.is_empty(port_text)) { port = parse_int(port_text) }
+
+    if (strings.starts_with(authority, "[")) {
+        var bracket_end = strings.index_of(copy(authority), "]", 0)
+        if (bracket_end < 0) { throw "websocket: invalid IPv6 host" }
+        host = strings.substring(copy(authority), 1, bracket_end)
+        if (bracket_end + 1 < strings.length(authority)) {
+            if (strings.char_code(authority, bracket_end + 1) != 58) {
+                throw "websocket: invalid host"
+            }
+            var port_text = strings.substring(copy(authority), bracket_end + 2, -1)
+            if (!strings.is_empty(port_text)) { port = parse_port(port_text) }
+        }
+    } else {
+        if (count_char(authority, 58) > 1) {
+            throw "websocket: IPv6 addresses must be bracketed"
+        }
+        var colon = last_index_of_char(authority, 58)
+        if (colon >= 0) {
+            host = strings.substring(copy(authority), 0, colon)
+            var port_text = strings.substring(copy(authority), colon + 1, -1)
+            if (!strings.is_empty(port_text)) { port = parse_port(port_text) }
+        }
     }
+
     if (strings.is_empty(host)) { throw "websocket: missing host in URL" }
-    return Url(host, port, path, secure)
+    return Url(host, port, path, secure, user, password)
+}
+
+fun format_authority(view Url url) -> string {
+    var host = copy(url.host)
+    if (strings.index_of(host, ":", 0) >= 0) { host = "[" + host + "]" }
+    var default_port = 80
+    if (url.secure) { default_port = 443 }
+    if (url.port == default_port) { return host }
+    return host + ":" + int_to_string(url.port)
+}
+
+fun format_host_header(view string host, int port) -> string {
+    var formatted = copy(host)
+    if (strings.index_of(formatted, ":", 0) >= 0 && !strings.starts_with(formatted, "[")) {
+        formatted = "[" + formatted + "]"
+    }
+    return formatted + ":" + int_to_string(port)
+}
+
+fun basic_auth(view string user, view string password) -> string {
+    return base64_encode_bytes(string_to_bytes(copy(user) + ":" + copy(password)))
+}
+
+fun resolve_url(view string base, view string location) -> string {
+    if (strings.starts_with(location, "ws://")
+        || strings.starts_with(location, "wss://")
+        || strings.starts_with(location, "http://")
+        || strings.starts_with(location, "https://")) {
+        return copy(location)
+    }
+
+    var parsed = parse_url(base)
+    var scheme = "ws"
+    if (parsed.secure) { scheme = "wss" }
+
+    if (strings.starts_with(location, "//")) {
+        return scheme + ":" + copy(location)
+    }
+
+    var authority = format_authority(parsed)
+    if (strings.starts_with(location, "/")) {
+        return scheme + "://" + authority + copy(location)
+    }
+
+    var directory = copy(parsed.path)
+    var slash = last_index_of_char(directory, 47)
+    if (slash >= 0) {
+        directory = strings.substring(directory, 0, slash + 1)
+    } else {
+        directory = "/"
+    }
+    return scheme + "://" + authority + copy(directory) + copy(location)
 }
 
 fun parse_ipv4(view string host) -> array[int] {
@@ -907,6 +1690,7 @@ fun parse_ipv4(view string host) -> array[int] {
         var code = strings.char_code(host, i)
         if (code >= 48 && code <= 57) {
             current = current * 10 + (code - 48)
+            if (current > 255) { throw "websocket: invalid IPv4 address" }
             has_digit = true
         } elif (code == 46) {
             if (!has_digit) { throw "websocket: invalid IPv4 address" }
@@ -923,76 +1707,127 @@ fun parse_ipv4(view string host) -> array[int] {
     return parts
 }
 
-fun resolve_socket(view string host, int port) -> int {
-    if (host == "localhost") {
-        var fd = -1
-        unsafe { fd = ws_tcp_connect_localhost(port) }
-        if (fd < 0) { throw "websocket.connect: cannot connect to localhost" }
-        return fd
-    }
-    // Try numeric IPv4 first
-    var is_ip = true
+fun is_ipv4_literal(view string host) -> bool {
     var length = strings.length(host)
-    if (length == 0) { is_ip = false }
+    if (length == 0) { return false }
     for (var i = 0; i < length; i = i + 1) {
         var code = strings.char_code(host, i)
-        if (!((code >= 48 && code <= 57) || code == 46)) {
-            is_ip = false
-        }
-    }
-    if (is_ip) {
-        var octets = parse_ipv4(host)
-        var fd = -1
-        unsafe {
-            fd = ws_tcp_connect_ip(arrays.get(octets, 0), arrays.get(octets, 1), arrays.get(octets, 2), arrays.get(octets, 3), port)
-        }
-        if (fd < 0) { throw "websocket.connect: cannot connect to " + copy(host) }
-        return fd
-    }
-    // Resolve hostname via C helper (DNS)
-    var fd = -1
-    unsafe {
-        ws_host_reset()
-        for (var i = 0; i < length; i = i + 1) {
-            var code = strings.char_code(host, i)
-            if (code >= 0) { ws_host_append(code & 255) }
-        }
-        fd = ws_host_connect(port)
-    }
-    if (fd < 0) { throw "websocket.connect: cannot connect to " + copy(host) }
-    return fd
-}
-
-fun send_text_bytes(int socket, view string text) -> bool {
-    var length = strings.length(text)
-    for (var i = 0; i < length; i = i + 1) {
-        var code = strings.char_code(text, i)
-        if (code < 0) { code = 63 }
-        var int b = code & 255
-        var sent = -1
-        unsafe {
-            var *const int p = memory.raw_address(&b)
-            sent = send(socket, p, 1, 0)
-        }
-        if (sent != 1) {
-            if (sent < 0) {
-                unsafe {
-                    var *const int p = memory.raw_address(&b)
-                    sent = send(socket, p, 1, 0)
-                }
-            }
-            if (sent != 1) { return false }
-        }
+        if (!((code >= 48 && code <= 57) || code == 46)) { return false }
     }
     return true
 }
 
-fun read_http_response(int socket) -> string {
+fun set_host_buffer(view string host) {
+    unsafe {
+        ws_host_reset()
+        var length = strings.length(host)
+        for (var i = 0; i < length; i = i + 1) {
+            var code = strings.char_code(host, i)
+            if (code >= 0) { ws_host_append(code & 255) }
+        }
+    }
+}
+
+fun set_ca_file(view string path) {
+    unsafe {
+        ws_ca_reset()
+        var length = strings.length(path)
+        for (var i = 0; i < length; i = i + 1) {
+            var code = strings.char_code(path, i)
+            if (code >= 0) { ws_ca_append(code & 255) }
+        }
+    }
+}
+
+fun set_client_cert(view string cert, view string key) {
+    unsafe {
+        ws_cert_reset()
+        ws_key_reset()
+        var cert_length = strings.length(cert)
+        for (var i = 0; i < cert_length; i = i + 1) {
+            var code = strings.char_code(cert, i)
+            if (code >= 0) { ws_cert_append(code & 255) }
+        }
+        var key_length = strings.length(key)
+        for (var i = 0; i < key_length; i = i + 1) {
+            var code = strings.char_code(key, i)
+            if (code >= 0) { ws_key_append(code & 255) }
+        }
+    }
+}
+
+fun resolve_socket(view string host, int port, int timeout_ms) -> int {
+    if (host == "localhost") {
+        var fd = -1
+        unsafe { fd = ws_tcp_connect_localhost(port, timeout_ms) }
+        if (fd < 0) { throw "cannot connect to localhost" }
+        return fd
+    }
+
+    if (is_ipv4_literal(host)) {
+        var octets = parse_ipv4(host)
+        var fd = -1
+        unsafe {
+            fd = ws_tcp_connect_ip(arrays.get(octets, 0), arrays.get(octets, 1), arrays.get(octets, 2), arrays.get(octets, 3), port, timeout_ms)
+        }
+        if (fd < 0) { throw "cannot connect to " + copy(host) }
+        return fd
+    }
+
+    var fd = -1
+    unsafe {
+        ws_host_reset()
+        var length = strings.length(host)
+        for (var i = 0; i < length; i = i + 1) {
+            var code = strings.char_code(host, i)
+            if (code >= 0) { ws_host_append(code & 255) }
+        }
+        fd = ws_host_connect(port, timeout_ms)
+    }
+    if (fd < 0) { throw "cannot connect to " + copy(host) }
+    return fd
+}
+
+fun send_raw(int socket, int tls_handle, bool is_tls, view string text) -> bool {
+    if (is_tls) {
+        unsafe { ws_tls_send_reset() }
+    } else {
+        unsafe { ws_send_reset() }
+    }
+
+    var length = strings.length(text)
+    for (var i = 0; i < length; i = i + 1) {
+        var code = strings.char_code(text, i)
+        if (code < 0) { code = 63 }
+        var bval = code & 255
+        var rc = -1
+        if (is_tls) {
+            unsafe { rc = ws_tls_send_put(tls_handle, bval) }
+        } else {
+            unsafe { rc = ws_send_put(socket, bval) }
+        }
+        if (rc != 0) { return false }
+    }
+
+    var flushed = -1
+    if (is_tls) {
+        unsafe { flushed = ws_tls_send_flush(tls_handle) }
+    } else {
+        unsafe { flushed = ws_send_flush(socket) }
+    }
+    return flushed == 0
+}
+
+fun read_http_response(int socket, int tls_handle, bool is_tls) -> string {
     var response = ""
     var max_bytes = 65536
     for (var i = 0; i < max_bytes; i = i + 1) {
         var b = -2
-        unsafe { b = ws_recv_byte(socket) }
+        if (is_tls) {
+            unsafe { b = ws_tls_recv_byte(tls_handle) }
+        } else {
+            unsafe { b = ws_recv_byte(socket) }
+        }
         if (b >= 0) {
             if (b <= 127) {
                 response = response + strings.from_char_code(b)
@@ -1003,7 +1838,6 @@ fun read_http_response(int socket) -> string {
                 break
             }
         } elif (b == -2) {
-            // timeout
             break
         } else {
             break
@@ -1012,33 +1846,243 @@ fun read_http_response(int socket) -> string {
     return response
 }
 
-/// Connect to a `ws://` URL and complete the opening handshake.
+fun close_handshake(int socket, int tls_handle) {
+    if (tls_handle >= 0) {
+        unsafe { ws_tls_close(tls_handle) }
+    } elif (socket > 0) {
+        unsafe { ws_close_fd(socket) }
+    }
+}
+
+fun parse_proxy(view string proxy) -> Url {
+    if (strings.contains(proxy, "://")) { return parse_url(proxy) }
+    return parse_url("http://" + copy(proxy))
+}
+
+fun request_headers(view Url parsed, view ConnectOptions options) -> string {
+    var headers = ""
+    if (!strings.is_empty(parsed.user)) {
+        headers = headers + "Authorization: Basic " + basic_auth(parsed.user, parsed.password) + "\r\n"
+    }
+    if (!strings.is_empty(options.headers)) {
+        headers = headers + copy(options.headers)
+        if (!string_ends_with(options.headers, "\r\n")) { headers = headers + "\r\n" }
+    }
+    return headers
+}
+
+fun proxy_tunnel(int socket, view string host, int port, view ConnectOptions options) -> bool {
+    var proxy = parse_proxy(options.proxy)
+    var target = format_host_header(host, port)
+    var req = "CONNECT " + target + " HTTP/1.1\r\nHost: " + target + "\r\n"
+    if (!strings.is_empty(proxy.user)) {
+        req = req + "Proxy-Authorization: Basic " + basic_auth(proxy.user, proxy.password) + "\r\n"
+    }
+    req = req + "\r\n"
+
+    if (!send_raw(socket, -1, false, req)) { return false }
+    var response = read_http_response(socket, -1, false)
+    return status_code(response) == 200
+}
+
+fun attempt_handshake(view Url parsed, view ConnectOptions options) -> HandshakeResult {
+    var outcome = HandshakeResult()
+    var socket = -1
+    var tls_handle = -1
+    var via_proxy = !strings.is_empty(options.proxy)
+    var connect_host = copy(parsed.host)
+    var connect_port = parsed.port
+
+    if (via_proxy) {
+        var proxy = parse_proxy(options.proxy)
+        connect_host = copy(proxy.host)
+        connect_port = proxy.port
+    }
+
+    if (parsed.secure) { set_host_buffer(parsed.host) }
+    set_ca_file(options.ca_file)
+    set_client_cert(options.client_cert, options.client_key)
+
+    try {
+        socket = resolve_socket(connect_host, connect_port, options.connect_timeout_ms)
+
+        if (via_proxy) {
+            if (!proxy_tunnel(socket, parsed.host, parsed.port, options)) {
+                outcome.error = "proxy CONNECT failed"
+                close_handshake(socket, -1)
+                return outcome
+            }
+        }
+
+        if (parsed.secure) {
+            set_host_buffer(parsed.host)
+            var verify_mode = 1
+            if (!options.verify_tls) {
+                verify_mode = 0
+            } elif (!strings.is_empty(options.ca_file)) {
+                verify_mode = 2
+            }
+            unsafe { tls_handle = ws_tls_connect(socket, verify_mode) }
+            if (tls_handle < 0) {
+                outcome.error = "TLS handshake failed"
+                close_handshake(socket, -1)
+                return outcome
+            }
+        }
+
+        var key = make_key()
+        var host_header = format_host_header(parsed.host, parsed.port)
+        var request = build_upgrade_request_ex(host_header, parsed.path, key, options.origin, options.protocols, request_headers(parsed, options))
+        if (!send_raw(socket, tls_handle, parsed.secure, request)) {
+            outcome.error = "failed to send handshake request"
+            close_handshake(socket, tls_handle)
+            return outcome
+        }
+
+        var response = read_http_response(socket, tls_handle, parsed.secure)
+        var status = status_code(response)
+        outcome.status = status
+
+        if (status == 301 || status == 302 || status == 303 || status == 307 || status == 308) {
+            var location = header_value(response, "Location")
+            if (!strings.is_empty(location)) {
+                outcome.redirect = location
+                close_handshake(socket, tls_handle)
+                return outcome
+            }
+        }
+
+        if (status != 101) {
+            outcome.error = "server did not accept WebSocket upgrade (status " + int_to_string(status) + ")"
+            close_handshake(socket, tls_handle)
+            return outcome
+        }
+
+        var accept = header_value(response, "Sec-WebSocket-Accept")
+        if (strings.is_empty(accept)) {
+            outcome.error = "missing Sec-WebSocket-Accept"
+            close_handshake(socket, tls_handle)
+            return outcome
+        }
+        if (!validate_accept(key, accept)) {
+            outcome.error = "invalid Sec-WebSocket-Accept"
+            close_handshake(socket, tls_handle)
+            return outcome
+        }
+
+        var selected = header_value(response, "Sec-WebSocket-Protocol")
+        if (!strings.is_empty(selected)
+            && !strings.is_empty(options.protocols)
+            && !header_has_token(options.protocols, strings.lower(selected))) {
+            outcome.error = "server selected an unrequested subprotocol"
+            close_handshake(socket, tls_handle)
+            return outcome
+        }
+
+        outcome.ok = true
+        outcome.socket = socket
+        outcome.tls_handle = tls_handle
+        outcome.key = key
+        outcome.protocol = selected
+        return outcome
+    } catch (err) {
+        close_handshake(socket, tls_handle)
+        outcome.error = copy(err)
+        return outcome
+    }
+}
+
+/// Connect to a `ws://` or `wss://` URL and complete the opening handshake.
 fun connect(view string url) -> Connection {
-    var parsed = parse_url(url)
-    if (parsed.secure) { throw "websocket.connect: wss:// requires TLS transport support" }
+    var options = ConnectOptions()
+    return connect_ex(url, options)
+}
 
-    var socket = resolve_socket(parsed.host, parsed.port)
-    var key = make_key()
-    var request = build_upgrade_request(parsed.host + ":" + int_to_string(parsed.port), parsed.path, key)
-    if (!send_text_bytes(socket, request)) {
-        unsafe { ws_close_fd(socket) }
-        throw "websocket.connect: failed to send handshake request"
+fun connect_ex(view string url, view ConnectOptions options) -> Connection {
+    var current = copy(url)
+    var redirects = 0
+
+    while (true) {
+        var parsed = parse_url(current)
+        var outcome = attempt_handshake(parsed, options)
+
+        if (outcome.ok) {
+            var conn = Connection(outcome.socket, outcome.key)
+            if (outcome.tls_handle >= 0) {
+                conn.tls = true
+                conn.tls_handle = outcome.tls_handle
+            }
+            conn.protocol = copy(outcome.protocol)
+            conn.configure(options)
+            return conn
+        }
+
+        if (!strings.is_empty(outcome.redirect) && redirects < options.max_redirects) {
+            current = resolve_url(current, outcome.redirect)
+            redirects = redirects + 1
+            continue
+        }
+
+        if (strings.starts_with(outcome.error, "websocket")) { throw outcome.error }
+        throw "websocket.connect: " + outcome.error
+    }
+}
+
+class Server {
+    var int fd
+    var bool open
+    var int max_message_size
+    var int max_frame_size
+
+    fun init(int port) {
+        var fd = -1
+        unsafe { fd = ws_listen(port, 16) }
+        if (fd < 0) { throw "websocket: cannot listen on port " + int_to_string(port) }
+        this.fd = fd
+        this.open = true
+        this.max_message_size = 67108864
+        this.max_frame_size = 16777216
     }
 
-    var response = read_http_response(socket)
-    if (!is_upgrade_response(response)) {
-        unsafe { ws_close_fd(socket) }
-        throw "websocket.connect: server did not accept WebSocket upgrade"
-    }
-    var accept = header_value(response, "Sec-WebSocket-Accept")
-    if (!strings.is_empty(accept) && !validate_accept(key, accept)) {
-        unsafe { ws_close_fd(socket) }
-        throw "websocket.connect: invalid Sec-WebSocket-Accept"
+    fun port() -> int {
+        var bound = -1
+        unsafe { bound = ws_local_port(this.fd) }
+        return bound
     }
 
-    var conn = Connection(socket, key)
-    conn.protocol = header_value(response, "Sec-WebSocket-Protocol")
-    return conn
+    fun accept() -> Connection {
+        if (!this.open) { throw "websocket: server is closed" }
+        var socket = -1
+        unsafe { socket = ws_accept(this.fd) }
+        if (socket < 0) { throw "websocket: accept failed" }
+
+        var request = read_http_response(socket, -1, false)
+        if (!is_upgrade_request(request)) {
+            send_raw(socket, -1, false, "HTTP/1.1 400 Bad Request\r\nConnection: close\r\nContent-Length: 0\r\n\r\n")
+            unsafe { ws_close_fd(socket) }
+            throw "websocket: invalid WebSocket upgrade request"
+        }
+
+        if (!send_raw(socket, -1, false, build_upgrade_response(request))) {
+            unsafe { ws_close_fd(socket) }
+            throw "websocket: failed to send upgrade response"
+        }
+
+        var key = header_value(request, "Sec-WebSocket-Key")
+        var conn = Connection(socket, key)
+        conn.server_side = true
+        conn.max_message_size = this.max_message_size
+        conn.max_frame_size = this.max_frame_size
+        return conn
+    }
+
+    fun stop() {
+        if (this.open) {
+            unsafe { ws_close_fd(this.fd) }
+        }
+        this.fd = 0
+        this.open = false
+    }
 }
 
 // ── Tests ──────────────────────────────────────────────────────────────────
@@ -1134,3 +2178,103 @@ test handshake_helpers {
     testing.assert_true(is_upgrade_response(resp))
     testing.assert_eq(header_value(resp, "Sec-WebSocket-Accept"), "s3pPLMBiTxaQ9kYGzzhZRbK+xOo=")
 }
+
+test utf8_roundtrip {
+    testing.assert_eq(bytes_to_string_utf8([104, 195, 169, 108, 108, 111]), "héllo")
+    testing.assert_true(is_valid_utf8([104, 195, 169, 108, 108, 111]))
+    testing.assert_false(is_valid_utf8([255]))
+    testing.assert_false(is_valid_utf8([195]))
+    testing.assert_false(is_valid_utf8([224, 128, 128]))
+    testing.assert_false(is_valid_utf8([237, 160, 128]))
+    testing.assert_false(is_valid_utf8([244, 144, 128, 128]))
+    testing.assert_eq(bytes_to_string_lossy([104, 255, 108]), "h�l")
+}
+
+test frame_rejects_invalid_headers {
+    var reserved_bits = decode([193, 0], 0)
+    testing.assert_false(reserved_bits.ok)
+
+    var reserved_opcode = decode([131, 0], 0)
+    testing.assert_false(reserved_opcode.ok)
+
+    var fragmented_ping = decode([9, 0], 0)
+    testing.assert_false(fragmented_ping.ok)
+
+    var oversized_ping = decode([137, 126, 0, 126], 0)
+    testing.assert_false(oversized_ping.ok)
+}
+
+test frame_rejects_invalid_lengths {
+    var truncated = decode([129, 127, 0, 0, 0, 1, 0, 0, 0, 0], 0)
+    testing.assert_false(truncated.ok)
+
+    var non_minimal = decode([129, 126, 0, 5, 1, 2, 3, 4, 5], 0)
+    testing.assert_false(non_minimal.ok)
+
+    var negative_64bit = decode([129, 127, 128, 0, 0, 0, 0, 0, 0, 0], 0)
+    testing.assert_false(negative_64bit.ok)
+}
+
+test decode_client_rejects_masked_frame {
+    var wire = text_message("Hello", [1, 2, 3, 4])
+    var raw = decode(wire, 0)
+    testing.assert_true(raw.ok)
+    var client = decode_client(wire, 0)
+    testing.assert_false(client.ok)
+}
+
+test header_value_matches_exact_names {
+    var resp = "HTTP/1.1 101 Switching Protocols\r\nX-Upgrade: websocket\r\nUpgrade: websocket\r\nConnection: Upgrade\r\n\r\n"
+    testing.assert_eq(header_value(resp, "Upgrade"), "websocket")
+    var fake = "HTTP/1.1 101 Switching Protocols\r\nX-Connection: Upgrade\r\nConnection: keep-alive\r\nUpgrade: websocket\r\n\r\n"
+    testing.assert_eq(header_value(fake, "Connection"), "keep-alive")
+}
+
+test upgrade_response_requires_101 {
+    var fake = "HTTP/1.1 500 FAIL\r\nX-Status: 101 x\r\nUpgrade: websocket\r\nConnection: Upgrade\r\n\r\n"
+    testing.assert_false(is_upgrade_response(fake))
+
+    var ok = "HTTP/1.1 101 Switching Protocols\r\nUpgrade: websocket\r\nConnection: keep-alive, Upgrade\r\n\r\n"
+    testing.assert_true(is_upgrade_response(ok))
+}
+
+test url_parsing_edge_cases {
+    var ipv6 = parse_url("ws://[::1]:8080/echo")
+    testing.assert_eq(ipv6.host, "::1")
+    testing.assert_eq(ipv6.port, 8080)
+    testing.assert_eq(ipv6.path, "/echo")
+
+    var query_only = parse_url("ws://example.com?token=x")
+    testing.assert_eq(query_only.host, "example.com")
+    testing.assert_eq(query_only.path, "/?token=x")
+
+    var auth = parse_url("wss://user:pass@example.com/chat")
+    testing.assert_eq(auth.user, "user")
+    testing.assert_eq(auth.password, "pass")
+    testing.assert_eq(auth.host, "example.com")
+    testing.assert_eq(auth.port, 443)
+
+    var fragment = parse_url("ws://example.com/chat#ignored")
+    testing.assert_eq(fragment.path, "/chat")
+}
+
+test random_mask_uses_full_byte_range {
+    var saw_high_bit = false
+    for (var i = 0; i < 256; i = i + 1) {
+        var mask = random_mask()
+        for (var j = 0; j < 4; j = j + 1) {
+            if ((arrays.get(mask, j) & 128) != 0) { saw_high_bit = true }
+        }
+    }
+    testing.assert_true(saw_high_bit)
+}
+
+test server_handshake_helpers {
+    var request = "GET /chat HTTP/1.1\r\nHost: example.com\r\nUpgrade: websocket\r\nConnection: Upgrade\r\nSec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==\r\nSec-WebSocket-Version: 13\r\n\r\n"
+    testing.assert_true(is_upgrade_request(request))
+    var response = build_upgrade_response(request)
+    testing.assert_true(is_upgrade_response(response))
+    testing.assert_eq(header_value(response, "Sec-WebSocket-Accept"), "s3pPLMBiTxaQ9kYGzzhZRbK+xOo=")
+}
+
+

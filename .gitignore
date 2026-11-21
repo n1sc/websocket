@@ -1,2 +1,8 @@
 build/
 .ntsc/
+native/*.o
+native/*.a
+tests/smoke/native/*.a
+tests/smoke/native/*.o
+tests/smoke/build/
+tests/smoke/.ntsc/
