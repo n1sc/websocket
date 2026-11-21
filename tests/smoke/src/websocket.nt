@@ -6,15 +6,16 @@
 
 use arrays
 use crypto
+use memory
 use strings
 use testing
 
+extern "C" fun send(int fd, *const int buf, int len, int flags) -> int
 extern "C" fun ws_host_reset()
 extern "C" fun ws_host_append(int ch)
 extern "C" fun ws_host_connect(int port) -> int
 extern "C" fun ws_tcp_connect_ip(int a, int b, int c, int d, int port) -> int
 extern "C" fun ws_tcp_connect_localhost(int port) -> int
-extern "C" fun ws_send_byte(int fd, int value) -> int
 extern "C" fun ws_recv_byte(int fd) -> int
 extern "C" fun ws_poll_read(int fd, int timeout_ms) -> int
 extern "C" fun ws_set_recv_timeout(int fd, int timeout_ms) -> int
@@ -686,19 +687,29 @@ class Connection {
         this.open = false
     }
 
-    /// Send raw frame bytes over the socket (byte-safe).
+    /// Send raw frame bytes over the socket (byte-safe) via direct libc FFI.
     fun transmit_bytes(view array[int] data) -> bool {
         if (!this.open || this.socket <= 0) { return false }
         var count = arrays.length(data)
         for (var i = 0; i < count; i = i + 1) {
-            var b = arrays.get(data, i) & 255
+            var int b = arrays.get(data, i) & 255
             var sent = -1
             unsafe {
-                sent = ws_send_byte(this.socket, b)
+                var *const int p = memory.raw_address(&b)
+                sent = send(this.socket, p, 1, 0)
             }
-            if (sent <= 0) {
-                this.last_error = "send failed"
-                return false
+            if (sent != 1) {
+                // retry once (e.g. EINTR); errno not inspected here
+                if (sent < 0) {
+                    unsafe {
+                        var *const int p = memory.raw_address(&b)
+                        sent = send(this.socket, p, 1, 0)
+                    }
+                }
+                if (sent != 1) {
+                    this.last_error = "send failed"
+                    return false
+                }
             }
         }
         return true
@@ -955,11 +966,23 @@ fun resolve_socket(view string host, int port) -> int {
 fun send_text_bytes(int socket, view string text) -> bool {
     var length = strings.length(text)
     for (var i = 0; i < length; i = i + 1) {
-        var b = strings.char_code(text, i)
-        if (b < 0) { b = 63 }
+        var code = strings.char_code(text, i)
+        if (code < 0) { code = 63 }
+        var int b = code & 255
         var sent = -1
-        unsafe { sent = ws_send_byte(socket, b & 255) }
-        if (sent <= 0) { return false }
+        unsafe {
+            var *const int p = memory.raw_address(&b)
+            sent = send(socket, p, 1, 0)
+        }
+        if (sent != 1) {
+            if (sent < 0) {
+                unsafe {
+                    var *const int p = memory.raw_address(&b)
+                    sent = send(socket, p, 1, 0)
+                }
+            }
+            if (sent != 1) { return false }
+        }
     }
     return true
 }

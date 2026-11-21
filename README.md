@@ -24,9 +24,12 @@ use websocket
 - **Framing**: encode/decode RFC 6455 frames (FIN, opcode, masking, payload
   lengths 7/16/64-bit), helpers for text/binary/close/ping/pong messages
 - **Client**: `ws://` URL parsing and TCP connect + opening handshake
-- **Byte-safe transport**: socket I/O uses a small native FFI helper
-  (`native/libwsio.a`) for byte-accurate send/receive (all byte values 0-255),
-  supporting masked client frames and binary payloads
+- **Byte-safe transport (Neutron FFI)**: sends use direct FFI calls to libc
+  `send` with raw byte pointers (`memory.raw_address` in `unsafe`); receive and
+  socket control use FFI bindings to a small native helper (`native/libwsio.a`)
+  for errno/struct-heavy operations (recv normalization, poll, timeouts,
+  connect/DNS), supporting all byte values 0-255 including masked frames and
+  binary payloads
 - **DNS resolution**: hostname resolution supported via the native helper
   (in addition to `localhost` and numeric IPv4 addresses)
 - **Polling/timeouts**: socket readability polling, configurable receive
@@ -121,9 +124,11 @@ fun main() {
 ## Notes and limitations
 
 - **`wss://` (TLS)** is not supported by `connect`.
-- Transport uses the bundled native FFI helper (`[ffi]` → `native/libwsio.a`)
-  for byte-safe TCP I/O. Hostname resolution is supported by the helper; the
-  target platform must be able to link against the provided library and libc.
+- Transport is implemented via Neutron FFI (`extern "C"` + `[ffi]`): direct
+  libc `send` for byte writes and a bundled native helper
+  (`native/libwsio.a`) for connect/DNS, recv normalization, poll, and
+  timeouts. The target platform must be able to link against the provided
+  library and libc.
 - Protocol correctness (handshake, framing, masking, SHA-1/Base64) is covered
   by in-memory tests, and end-to-end behavior is covered by `tests/smoke/`.
 
