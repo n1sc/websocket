@@ -3,8 +3,8 @@
 WebSocket protocol support for Neutron.
 
 Implements the RFC 6455 protocol core in pure Neutron: opening handshake,
-SHA-1/Base64 accept calculation, frame encoding/decoding, masking, and a
-`ws://` client connection API.
+SHA-1/Base64 accept calculation, frame encoding/decoding, masking, plus
+`ws://`/`wss://` client connections and `ws://` server connections.
 
 ## Install
 
@@ -23,13 +23,19 @@ use websocket
 - **Crypto primitives**: pure-Neutron SHA-1 and Base64 (byte-array APIs)
 - **Framing**: encode/decode RFC 6455 frames (FIN, opcode, masking, payload
   lengths 7/16/64-bit), helpers for text/binary/close/ping/pong messages
-- **Client**: `ws://` URL parsing and TCP connect + opening handshake
+- **Client**: `ws://` and `wss://` URL parsing, TCP connect, TLS handshake
+  (for `wss://`), and WebSocket opening handshake
+- **Server**: `Server(port)` accepts TCP clients, validates the opening
+  handshake, and returns server-side `Connection` instances that expect masked
+  client frames and send unmasked server frames
 - **Byte-safe transport (Neutron FFI)**: sends use direct FFI calls to libc
   `send` with raw byte pointers (`memory.raw_address` in `unsafe`); receive and
   socket control use FFI bindings to a small native helper (`native/libwsio.a`)
   for errno/struct-heavy operations (recv normalization, poll, timeouts,
-  connect/DNS), supporting all byte values 0-255 including masked frames and
-  binary payloads
+  connect/DNS, TLS), supporting all byte values 0-255 including masked frames
+  and binary payloads
+- **TLS (`wss://`)**: OpenSSL-backed TLS via the native helper, with SNI and
+  peer/hostname verification enabled
 - **DNS resolution**: hostname resolution supported via the native helper
   (in addition to `localhost` and numeric IPv4 addresses)
 - **Polling/timeouts**: socket readability polling, configurable receive
@@ -60,16 +66,45 @@ use websocket
 - `apply_mask(view array[int] payload, view array[int] masking_key) -> array[int]`
 - `random_mask() -> array[int]`
 
-Types: `Frame`, `DecodeResult`, `Url`, `Connection`.
+Types: `Frame`, `DecodeResult`, `Url`, `Connection`, `ConnectOptions`, `Server`.
 
 ### Client
 
 - `parse_url(view string url) -> Url`
-- `connect(view string url) -> Connection`
+- `connect(view string url) -> Connection` — supports `ws://` and `wss://`
+- `connect_ex(view string url, view ConnectOptions options) -> Connection` —
+  configurable connect (see below)
 
 `Connection` methods: `send_text`, `send_binary_hex`, `send_ping`, `send_pong`,
 `send_close`, `pump`, `pump_nonblocking`, `poll`, `set_recv_timeout`,
-`receive_frame`, `transmit_bytes`, `close_socket`.
+`receive_frame`, `receive_message`, `receive_message_nonblocking`,
+`transmit_bytes`, `close_socket`.
+
+`ConnectOptions` fields: `origin`, `protocols`, `headers`, `proxy`,
+`connect_timeout_ms`, `recv_timeout_ms`, `max_message_size`, `max_frame_size`,
+`send_fragment_size`, `max_redirects`, `verify_tls`, `ca_file`, `client_cert`,
+`client_key`. Defaults are applied by `ConnectOptions()`, so only the fields
+that differ need to be set:
+
+```nt
+var options = websocket.ConnectOptions()
+options.recv_timeout_ms = 5000
+options.verify_tls = true
+var conn = websocket.connect_ex("wss://echo.example.com/chat", options)
+```
+
+### Server
+
+- `Server(int port) -> Server` — binds `0.0.0.0:port`; pass `0` to let the OS
+  choose an ephemeral port
+- `server.port() -> int` — the bound port
+- `server.accept() -> Connection` — blocks until a client connects, performs
+  the opening handshake, and returns a server-side `Connection`
+- `server.stop()` — closes the listening socket
+
+A server-side `Connection` exposes the same send/receive API as a client one,
+but decoding expects masked client frames and encoding emits unmasked frames.
+`accept` throws if the peer does not send a valid WebSocket upgrade request.
 
 ### Utilities
 
@@ -101,12 +136,31 @@ fun main() {
         say(decoded.frame.payload_text())
     }
 
-    // Connect to a ws:// endpoint (network required)
+    // Connect to a ws:// or wss:// endpoint (network required)
     // var conn = websocket.connect("ws://127.0.0.1:8080/chat")
+    // var secure = websocket.connect("wss://echo.example.com/chat")
     // conn.send_text("hello")
     // var out = websocket.empty_frame()
     // if (conn.pump(4096) && conn.receive_frame(out)) { say(out.payload_text()) }
     // conn.send_close(1000, "bye")
+}
+```
+
+### Server
+
+```nt
+use websocket
+
+fun main() {
+    var server = websocket.Server(8080)
+    var conn = server.accept()
+    var request = websocket.empty_frame()
+    if (conn.receive_message(request)) {
+        say(request.payload_text())
+        conn.send_text("pong")
+    }
+    conn.send_close(1000, "bye")
+    server.stop()
 }
 ```
 
@@ -121,16 +175,32 @@ fun main() {
 - A live end-to-end smoke test (local echo server + client) is included under
   `tests/smoke/` (`run.sh`).
 
+## Native helper build
+
+Transport is implemented via Neutron FFI (`extern "C"` + `[ffi]`): direct
+libc `send` for byte writes and a native helper (`native/libwsio.a`) for
+connect/DNS, recv normalization, poll, timeouts, and TLS (`wss://`).
+
+Build the helper for your platform before building projects that depend on it:
+
+```sh
+make -C native
+```
+
+Requirements: a C compiler/toolchain (`cc`, `ar`) and OpenSSL development
+headers/libraries (`libssl`, `libcrypto`). The package links
+`wsio, ssl, crypto, c` as configured in `neutron.toml`.
+
 ## Notes and limitations
 
-- **`wss://` (TLS)** is not supported by `connect`.
-- Transport is implemented via Neutron FFI (`extern "C"` + `[ffi]`): direct
-  libc `send` for byte writes and a bundled native helper
-  (`native/libwsio.a`) for connect/DNS, recv normalization, poll, and
-  timeouts. The target platform must be able to link against the provided
-  library and libc.
+- `wss://` uses OpenSSL with SNI and default peer/hostname verification; the
+  runtime environment must provide trusted CA certificates and network access.
+- Server connections are plain `ws://`; TLS termination for incoming
+  connections is not built in.
 - Protocol correctness (handshake, framing, masking, SHA-1/Base64) is covered
-  by in-memory tests, and end-to-end behavior is covered by `tests/smoke/`.
+  by in-memory tests. End-to-end `ws://` behavior is covered by
+  `tests/smoke/` (local echo server). `wss://` requires network access to an
+  external TLS endpoint for live verification.
 
 ## License
 
